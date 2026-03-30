@@ -1,6 +1,12 @@
 -- Sweep Configuration
 
-Utils = _G.import'utils'
+IGNORE_FILETYPES = {
+    'aerial', 'alpha', 'cfg', 'cmp_docs', 'cmp_menu', 'codecompanion_popup',
+    'conf', 'dbui', 'diff', 'fzf', 'git', 'help', 'lazy', 'list', 'lspinfo',
+    'mail', 'man', 'markdown', 'mason', 'neo-tree', 'nerdtree', 'nofile',
+    'NvimTree', 'oil', 'packer', 'plaintext', 'qf', 'readdir', 'registers',
+    'startify', 'terminal', 'term', 'text', 'toggleterm', 'trouble',
+}
 
 export default class Config
     defaults: {
@@ -33,7 +39,7 @@ export default class Config
             idle_completion_delay: 50   -- ms after typing stops before triggering
             text_change_debounce: 50    -- ms debounce for TextChangedI
             edit_prediction_delay: 1000 -- ms to wait in normal mode before showing edit prediction
-            ignore_filetypes: Utils.ignore
+            ignore_filetypes: IGNORE_FILETYPES
             ignore_gitignored: false
             enabled_modes: { 'i', 'n' }  -- FIM in insert, edit in normal
             min_line_length: 0          -- Min chars on current line to trigger

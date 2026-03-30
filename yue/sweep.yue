@@ -281,7 +281,7 @@ class Sweep
         -- Must nil the global so the module creates a fresh instance
         -- with the newly loaded class definitions
         global sweep = nil
-        _G.import'sweep'.setup(saved_opts)
+        require('sweep').setup(saved_opts)
         vim.notify("Sweep: Reloaded with user options preserved", vim.log.levels.INFO)
 
     cmd_hide: () =>
