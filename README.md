@@ -99,8 +99,9 @@ huggingface-cli download \
 The plugin will automatically start the proxy when Neovim loads
 (`provider.auto_start = true` by default), so you don't need to start it
 manually or set up a system service. Just make sure `provider.proxy_script`
-points to the correct path (defaults to
-`$XDG_CONFIG_HOME/nvim/scripts/sweep/sweep_proxy.py`).
+points to the correct path (defaults to the plugin's own `proxy/sweep_proxy.py`
+inside the lazy data directory). Set `provider.model_path` to the absolute path
+of your GGUF model file; if unset the proxy looks for it relative to the script.
 
 The proxy is a single persistent process shared across all Neovim instances.
 If it is already running when a second instance starts, the new instance
@@ -193,7 +194,8 @@ require("sweep").setup({
         repeat_penalty     = 1.0,
         completion_timeout = 5000,     -- ms
         auto_start         = true,
-        proxy_script       = vim.fn.stdpath("config") .. "/scripts/sweep/sweep_proxy.py",
+        proxy_script       = vim.fn.stdpath("data") .. "/lazy/sweep.nvim/proxy/sweep_proxy.py",
+        model_path         = nil,      -- Path to GGUF model (nil = proxy default)
     },
 
     context = {
