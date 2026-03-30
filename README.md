@@ -27,6 +27,10 @@ attention and full GPU KV-cache offload enabled by default), round-trip
 latency is significantly lower — particularly noticeable on short FIM
 completions where the model is fast but transport overhead dominates.
 
+The proxy is also a single shared process — all open Neovim instances connect
+to the same socket, so the model is only loaded into memory once regardless
+of how many editors are running.
+
 sweep.nvim also requires no extra language runtime to build: no Go toolchain,
 just Python.
 
@@ -97,6 +101,10 @@ The plugin will automatically start the proxy when Neovim loads
 manually or set up a system service. Just make sure `provider.proxy_script`
 points to the correct path (defaults to
 `$XDG_CONFIG_HOME/nvim/scripts/sweep/sweep_proxy.py`).
+
+The proxy is a single persistent process shared across all Neovim instances.
+If it is already running when a second instance starts, the new instance
+connects to the existing socket rather than spawning a duplicate.
 
 If you prefer to manage the proxy yourself, you can disable auto-start and
 run it manually:
