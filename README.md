@@ -27,35 +27,12 @@ Runs a local Python proxy (`sweep_proxy.py`) that loads the model via
 ## Requirements
 
 - Neovim 0.10+
-- [YueScript](https://github.com/IppClub/YueScript) (to build from source)
 - Python 3.10+ with `llama-cpp-python`, `fastapi`, `uvicorn`
 - The `sweep-next-edit` GGUF model (see [Model](#model) below)
 
 ## Installation
 
-### 1. Build the plugin
-
-```bash
-git clone https://github.com/c0r73x/sweep.nvim
-cd sweep.nvim
-make
-```
-
-The compiled Lua bytecode is written to `lua/`.
-
-### 2. Install with lazy.nvim
-
-```lua
-{
-    dir = "/path/to/sweep.nvim",
-    event = { "VeryLazy", "InsertEnter", "BufReadPost", "BufNewFile" },
-    config = function()
-        require("sweep").setup({})
-    end,
-}
-```
-
-Or from GitHub once the repo is public:
+### 1. Install with lazy.nvim
 
 ```lua
 {
