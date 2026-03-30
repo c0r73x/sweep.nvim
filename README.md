@@ -92,6 +92,15 @@ huggingface-cli download \
 
 #### Run the proxy
 
+The plugin will automatically start the proxy when Neovim loads
+(`provider.auto_start = true` by default), so you don't need to start it
+manually or set up a system service. Just make sure `provider.proxy_script`
+points to the correct path (defaults to
+`$XDG_CONFIG_HOME/nvim/scripts/sweep/sweep_proxy.py`).
+
+If you prefer to manage the proxy yourself, you can disable auto-start and
+run it manually:
+
 ```bash
 python3 proxy/sweep_proxy.py
 ```
@@ -100,9 +109,12 @@ The proxy listens on:
 - Unix socket: `$XDG_RUNTIME_DIR/sweep.sock` (or `/tmp/sweep-<uid>.sock`)
 - HTTP: `http://127.0.0.1:5555`
 
-#### Auto-start (systemd — Linux)
+#### System service (optional)
 
-Copy and edit the template:
+If you want the proxy to start at login independently of Neovim, service
+templates are provided.
+
+**Linux (systemd):**
 
 ```bash
 cp proxy/sweep-proxy.service ~/.config/systemd/user/sweep-proxy.service
@@ -110,9 +122,7 @@ cp proxy/sweep-proxy.service ~/.config/systemd/user/sweep-proxy.service
 systemctl --user enable --now sweep-proxy
 ```
 
-#### Auto-start (LaunchAgent — macOS)
-
-Copy and edit the template:
+**macOS (LaunchAgent):**
 
 ```bash
 cp proxy/com.user.sweep-proxy.plist.template \
