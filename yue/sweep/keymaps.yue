@@ -1,0 +1,65 @@
+-- Keymap Setup
+
+api = vim.api
+
+-- Accept completion callback for expr mappings
+make_accept_callback = (key) ->
+    () ->
+        ct = _G.sweep
+        if ct and ct.ghost_text and ct.ghost_text\has_completion()
+            return ct\accept()
+        else
+            return key
+
+-- Manual trigger callback
+trigger_callback = () ->
+    ct = _G.sweep
+    if ct and ct.ghost_text
+        bufnr = api.nvim_get_current_buf()
+        ct.buffer_state\update_state(bufnr)
+        ct\trigger_completion(bufnr)
+
+-- Normal mode accept
+normal_accept_callback = () ->
+    ct = _G.sweep
+    if ct and ct.ghost_text and ct.ghost_text\has_completion()
+        ct\accept()
+
+-- Normal mode reject (pass through Esc if no completion)
+normal_reject_callback = () ->
+    ct = _G.sweep
+    if ct and ct.ghost_text and ct.ghost_text\has_completion()
+        ct\reject()
+    else
+        api.nvim_feedkeys(api.nvim_replace_termcodes('<Esc>', true, false, true), 'n', false)
+
+export default {
+    setup_keymaps: (sweep) ->
+        -- Insert mode: accept with Tab (expr mapping)
+        if sweep.config.keymaps.accept
+            key = sweep.config.keymaps.accept
+            accept_callback = make_accept_callback(key)
+            vim.keymap.set('i', key, accept_callback, {
+                expr: true
+                desc: 'Accept Sweep completion'
+            })
+
+        if sweep.config.keymaps.sweep
+            key = sweep.config.keymaps.sweep
+            vim.keymap.set('n', key, normal_accept_callback, {
+                desc: 'Accept Sweep edit prediction'
+            })
+
+        -- Normal mode: Esc to reject (nowait to avoid swallowing next keypress)
+        vim.keymap.set('n', '<Esc>', normal_reject_callback, {
+            nowait: true
+            desc: 'Reject Sweep or normal Esc'
+        })
+
+        -- Manual trigger
+        if sweep.config.keymaps.trigger
+            key = sweep.config.keymaps.trigger
+            vim.keymap.set({'i', 'n'}, key, trigger_callback, {
+                desc: 'Trigger Sweep completion'
+            })
+}

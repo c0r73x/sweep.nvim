@@ -1,0 +1,34 @@
+-- Sweep lualine component
+-- Shows: spinner when processing, server status indicator always
+
+sweep_component = {
+    spinner_symbols: {'⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'},
+    spinner_index: 0,
+    spinner_symbols_len: 10,
+}
+
+-- Always show when sweep is loaded
+sweep_component.is_processing = () =>
+    return _G.sweep ~= nil
+
+sweep_component.update_status = () =>
+    ct = _G.sweep
+    return '' unless ct
+
+    -- Server status
+    connected = ct.client and ct.client.connected
+    transport = ct.client and ct.client.transport
+
+    if ct\is_processing()
+        -- Animate spinner during processing
+        sweep_component.spinner_index = (sweep_component.spinner_index % sweep_component.spinner_symbols_len) + 1
+        spinner = sweep_component.spinner_symbols[sweep_component.spinner_index]
+        return "#{spinner} SW"
+    elseif connected or transport == 'http'
+        -- Server is available
+        return '● SW'
+    else
+        -- Server unavailable
+        return '○ SW'
+
+export default sweep_component

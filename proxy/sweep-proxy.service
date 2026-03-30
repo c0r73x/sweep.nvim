@@ -1,0 +1,19 @@
+[Unit]
+Description=Sweep AI Code Completion Proxy
+After=network.target
+
+[Service]
+Type=simple
+User=%USER%
+WorkingDirectory=/home/%USER%/.config/nvim/scripts/sweep
+ExecStart=/usr/bin/python3 /home/%USER%/.config/nvim/scripts/sweep/sweep_proxy.py
+Restart=always
+RestartSec=5
+StandardOutput=append:/home/%USER%/.local/state/nvim/sweep_proxy.log
+StandardError=append:/home/%USER%/.local/state/nvim/sweep_proxy.err
+
+# Environment
+Environment="PATH=/usr/bin:/bin:/usr/local/bin"
+
+[Install]
+WantedBy=default.target

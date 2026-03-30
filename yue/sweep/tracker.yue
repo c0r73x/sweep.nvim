@@ -1,0 +1,209 @@
+-- Edit History Tracker
+-- Tracks buffer changes via nvim_buf_attach to build diff context for the
+-- sweep-next-edit prompt. Also tracks recently visited buffers for context.
+
+api = vim.api
+
+export default class EditTracker
+    config: nil
+    max_edits: 6
+    max_recent_files: 3
+    context_file_lines: 60
+    -- Per-buffer data
+    attached_bufs: {}       -- bufnr -> true (already attached)
+    original_contents: {}   -- bufnr -> {lines} (content when first opened)
+    line_snapshots: {}      -- bufnr -> {lines} (last-known line content for diff)
+    -- Global edit history (across buffers, most recent last)
+    edit_history: {}
+    -- Recently visited buffers (ordered, most recent last)
+    recent_files: {}
+
+    new: (config) =>
+        @config = config
+        ctx = config.context or {}
+        @max_edits = ctx.max_edit_history or 6
+        @max_recent_files = ctx.max_context_files or 3
+        @context_file_lines = ctx.context_file_lines or 60
+        @attached_bufs = {}
+        @original_contents = {}
+        @line_snapshots = {}
+        @edit_history = {}
+        @recent_files = {}
+
+    -- Attach to a buffer to track changes
+    attach: (bufnr) =>
+        bufnr = bufnr or api.nvim_get_current_buf()
+        return if @attached_bufs[bufnr]
+        return unless api.nvim_buf_is_valid(bufnr)
+        return if vim.bo[bufnr].buftype ~= ''
+
+        -- Snapshot the full content as "original" (session baseline)
+        lines = api.nvim_buf_get_lines(bufnr, 0, -1, false)
+        @original_contents[bufnr] = vim.deepcopy(lines)
+        @line_snapshots[bufnr] = vim.deepcopy(lines)
+
+        self = @
+        api.nvim_buf_attach(bufnr, false, {
+            on_lines: (_, buf, _, first_line, last_line, new_last_line, ...) ->
+                self\on_lines_changed(buf, first_line, last_line, new_last_line)
+
+            on_detach: (_, buf) ->
+                self.attached_bufs[buf] = nil
+                self.line_snapshots[buf] = nil
+        })
+
+        @attached_bufs[bufnr] = true
+
+    -- Called by nvim_buf_attach when lines change
+    -- first_line, last_line: 0-indexed range of OLD lines that were replaced
+    -- new_last_line: 0-indexed end of the NEW replacement range
+    on_lines_changed: (bufnr, first_line, last_line, new_last_line) =>
+        snapshot = @line_snapshots[bufnr]
+        return unless snapshot
+
+        -- Extract old lines from our snapshot
+        old_lines = {}
+        for i = first_line + 1, last_line
+            table.insert(old_lines, snapshot[i] or '')
+
+        -- Read new lines from the buffer
+        new_lines = api.nvim_buf_get_lines(bufnr, first_line, new_last_line, false)
+
+        -- Skip trivial changes (identical content)
+        if #old_lines == #new_lines
+            identical = true
+            for i = 1, #old_lines
+                if old_lines[i] ~= new_lines[i]
+                    identical = false
+                    break
+            return if identical
+
+        -- Skip whitespace-only changes
+        old_text = table.concat(old_lines, '\n')\gsub('%s+', '')
+        new_text = table.concat(new_lines, '\n')\gsub('%s+', '')
+        return if old_text == new_text
+
+        -- Record the edit
+        filepath = api.nvim_buf_get_name(bufnr)
+        if #filepath == 0
+            filepath = "buffer_#{bufnr}"
+
+        -- Make filepath relative to cwd
+        cwd = vim.fn.getcwd()
+        if filepath\sub(1, #cwd) == cwd
+            filepath = filepath\sub(#cwd + 2)
+
+        edit = {
+            filepath: filepath
+            start_line: first_line + 1  -- 1-indexed for prompt
+            end_line: first_line + math.max(#old_lines, #new_lines)
+            old_lines: old_lines
+            new_lines: new_lines
+            timestamp: vim.uv.hrtime()
+        }
+
+        table.insert(@edit_history, edit)
+
+        -- Trim to MAX_EDITS
+        while #@edit_history > @max_edits
+            table.remove(@edit_history, 1)
+
+        -- Update snapshot to current buffer state
+        @line_snapshots[bufnr] = api.nvim_buf_get_lines(bufnr, 0, -1, false)
+
+    -- Track buffer visit for recent files context
+    track_visit: (bufnr) =>
+        bufnr = bufnr or api.nvim_get_current_buf()
+        return unless api.nvim_buf_is_valid(bufnr)
+        return if vim.bo[bufnr].buftype ~= ''
+
+        filepath = api.nvim_buf_get_name(bufnr)
+        return if #filepath == 0
+
+        -- Remove existing entry for this buffer (will re-add at end)
+        for i = #@recent_files, 1, -1
+            if @recent_files[i].bufnr == bufnr
+                table.remove(@recent_files, i)
+
+        -- Get cursor position for context centering
+        pos = api.nvim_win_get_cursor(0)
+
+        table.insert(@recent_files, {
+            bufnr: bufnr
+            filepath: filepath
+            cursor_line: pos[1]
+        })
+
+        -- Trim to MAX_RECENT_FILES (excluding current buffer)
+        while #@recent_files > @max_recent_files + 1
+            table.remove(@recent_files, 1)
+
+    -- Get formatted diff sections for the sweep prompt
+    -- Returns list of strings, each a complete <|file_sep|>...original:...updated: block
+    get_diff_sections: () =>
+        sections = {}
+        for _, edit in ipairs(@edit_history)
+            parts = {}
+            table.insert(parts, "<|file_sep|>#{edit.filepath}.diff")
+            table.insert(parts, "original:")
+            for _, line in ipairs(edit.old_lines)
+                table.insert(parts, line)
+            table.insert(parts, "updated:")
+            for _, line in ipairs(edit.new_lines)
+                table.insert(parts, line)
+            table.insert(sections, table.concat(parts, '\n'))
+        return sections
+
+    -- Get context file chunks from recently visited buffers
+    -- Excludes the current buffer (which is handled separately in the prompt)
+    get_context_files: (exclude_bufnr) =>
+        chunks = {}
+        for _, entry in ipairs(@recent_files)
+            continue if entry.bufnr == exclude_bufnr
+            continue unless api.nvim_buf_is_valid(entry.bufnr)
+
+            filepath = entry.filepath
+            cwd = vim.fn.getcwd()
+            if filepath\sub(1, #cwd) == cwd
+                filepath = filepath\sub(#cwd + 2)
+
+            total_lines = api.nvim_buf_line_count(entry.bufnr)
+
+            if total_lines <= @context_file_lines
+                -- Small file: include entirely
+                lines = api.nvim_buf_get_lines(entry.bufnr, 0, -1, false)
+                table.insert(chunks, {
+                    filepath: filepath
+                    lines: lines
+                })
+            else
+                -- Large file: center around last cursor position
+                center = entry.cursor_line or 1
+                half = math.floor(@context_file_lines / 2)
+                start_line = math.max(0, center - half - 1)
+                end_line = math.min(total_lines, start_line + @context_file_lines)
+                lines = api.nvim_buf_get_lines(entry.bufnr, start_line, end_line, false)
+                table.insert(chunks, {
+                    filepath: filepath
+                    lines: lines
+                })
+
+        return chunks
+
+    -- Get original file content for a buffer (session baseline)
+    get_original_content: (bufnr) =>
+        return @original_contents[bufnr]
+
+    -- Clean up when buffer is closed/left
+    detach: (bufnr) =>
+        @attached_bufs[bufnr] = nil
+        @line_snapshots[bufnr] = nil
+        -- Keep original_contents and edit_history (useful across buffer switches)
+
+    -- Full cleanup
+    clear: () =>
+        @attached_bufs = {}
+        @original_contents = {}
+        @line_snapshots = {}
+        @edit_history = {}
+        @recent_files = {}

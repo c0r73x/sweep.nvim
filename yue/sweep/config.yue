@@ -1,0 +1,118 @@
+-- Sweep Configuration
+
+Utils = _G.import'utils'
+
+export default class Config
+    defaults: {
+        enabled: true
+        log_level: 'info'  -- 'debug' | 'info' | 'warn' | 'error'
+        state_dir: "#{vim.fn.stdpath('state')}/sweep"
+
+        keymaps: {
+            accept: '<Tab>'         -- Accept full completion
+            sweep: '<Tab>'          -- Accept sweep edit
+            partial_accept: false   -- Accept word-by-word (key or false to disable)
+            reject: false           -- Explicit reject key (or false, ESC always rejects)
+            trigger: false          -- Manual trigger key (or false for auto-only)
+        }
+
+        ui: {
+            completions: {
+                addition_style: 'highlight'  -- 'highlight' | 'inline'
+                fg_opacity: 1.0
+            }
+            jump: {
+                enabled: false      -- Cursor prediction jump indicator
+                symbol: ' '
+                text: ' TAB '
+                show_distance: true
+            }
+        }
+
+        behavior: {
+            idle_completion_delay: 50   -- ms after typing stops before triggering
+            text_change_debounce: 50    -- ms debounce for TextChangedI
+            edit_prediction_delay: 1000 -- ms to wait in normal mode before showing edit prediction
+            ignore_filetypes: Utils.ignore
+            ignore_gitignored: false
+            enabled_modes: { 'i', 'n' }  -- FIM in insert, edit in normal
+            min_line_length: 0          -- Min chars on current line to trigger
+            max_file_lines: 10000       -- Skip completions in huge files
+            hide_on_cursor_move: true   -- Hide edit predictions when cursor moves
+        }
+
+        provider: {
+            type: 'sweep'               -- Provider type identifier
+            url: 'http://127.0.0.1:5555' -- HTTP endpoint (fallback)
+            -- Completion mode: 'auto' (FIM in insert, edit in normal), 'fim', 'edit'
+            mode: 'auto'
+            -- Model generation parameters
+            max_tokens: 512             -- Max tokens for edit completions
+            fim_max_tokens: 128         -- Max tokens for FIM (inline) completions
+            max_fim_lines: 4            -- Max lines for FIM output
+            temperature: 0.0            -- Greedy (proxy maps 0.0 to 0.01)
+            top_p: 1.0                  -- Nucleus sampling (1.0 = disabled)
+            top_k: 50                   -- Top-k sampling
+            repeat_penalty: 1.0         -- Repetition penalty (1.0 = disabled)
+            -- Connection settings
+            completion_timeout: 5000    -- ms before giving up on a request
+            auto_start: true            -- Auto-start proxy on VeryLazy
+            proxy_script: "#{vim.fn.stdpath('config')}/scripts/sweep/sweep_proxy.py"
+        }
+
+        context: {
+            window_radius: 10           -- Lines above/below cursor (21 total)
+            max_edit_history: 6         -- Recent edit hunks to include in prompt
+            max_context_files: 3        -- Recently visited files for context
+            context_file_lines: 60      -- Max lines per context file chunk
+            initial_file_lines: 300     -- Lines from original file in prompt
+        }
+
+        blink: {
+            enabled: true
+            ghost_text: true
+        }
+    }
+
+    config: nil
+
+    setup: (opts={}) =>
+        @config = vim.tbl_deep_extend('force', @defaults, opts)
+        @ensure_state_dir()
+        @setup_highlights()
+        return @config
+
+    get: (key=nil) =>
+        return @config unless key
+        parts = vim.split(key, '.')
+        result = @config
+        for part in *parts
+            result = result[part]
+            break unless result
+        return result
+
+    set: (key, value) =>
+        parts = vim.split(key, '.')
+        current = @config
+        for i=1,#parts-1
+            current = current[parts[i]]
+        current[parts[#parts]] = value
+
+    ensure_state_dir: () =>
+        state_dir = @config.state_dir
+        unless vim.uv.fs_stat(state_dir)
+            vim.fn.mkdir(state_dir, 'p')
+
+    setup_highlights: () =>
+        -- Fallback highlight groups (default: true lets theme override)
+        highlights = {
+            SweepCompletion: { link: 'Comment', default: true }
+            SweepAddition: { link: 'DiffAdd', default: true }
+            SweepDeletion: { link: 'DiffDelete', default: true }
+            SweepModification: { link: 'DiffText', default: true }
+            SweepJumpSymbol: { link: 'Identifier', default: true }
+            SweepJumpText: { fg: '#ffffff', bg: '#565f89', default: true }
+        }
+
+        for name, opts in pairs(highlights)
+            vim.api.nvim_set_hl(0, name, opts)

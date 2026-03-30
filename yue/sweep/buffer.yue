@@ -1,0 +1,217 @@
+-- Buffer State Management
+
+api = vim.api
+
+export default class BufferState
+    config: nil
+    buffer_states: {}
+    window_radius: 10
+
+    new: (config) =>
+        @config = config
+        @buffer_states = {}
+        ctx = config.context or {}
+        @window_radius = ctx.window_radius or 10
+        -- Build lookup sets for O(1) checks on hot path
+        @_ignore_ft_set = {}
+        for ft in *config.behavior.ignore_filetypes
+            @_ignore_ft_set[ft] = true
+        @_mode_set = {}
+        for m in *config.behavior.enabled_modes
+            @_mode_set[m] = true
+
+    is_valid_buffer: (bufnr) =>
+        bufnr = bufnr or api.nvim_get_current_buf()
+
+        return false unless api.nvim_buf_is_valid(bufnr)
+
+        -- Check buftype (fast, eliminates popups/floating/terminal)
+        return false if vim.bo[bufnr].buftype != ''
+
+        -- Check filetype (O(1) set lookup)
+        ft = vim.bo[bufnr].filetype
+        return false if @_ignore_ft_set[ft]
+
+        -- Check mode (O(1) set lookup)
+        mode = api.nvim_get_mode().mode
+        return false unless @_mode_set[mode]
+
+        -- Skip huge files
+        max_lines = @config.behavior.max_file_lines or 10000
+        if max_lines > 0
+            return false if api.nvim_buf_line_count(bufnr) > max_lines
+
+        return true
+
+    -- Scope node types for treesitter window extension
+    _scope_types: {
+        'function_declaration': true, 'function_definition': true
+        'method_declaration': true, 'method_definition': true
+        'class_declaration': true, 'class_definition': true
+        'function_item': true, 'impl_item': true
+    }
+
+    -- Comment node types (covers most treesitter grammars)
+    _comment_types: {
+        'comment': true, 'line_comment': true, 'block_comment': true
+        'comment_block': true, 'documentation_comment': true
+    }
+
+    -- Get a context window around cursor, extended via treesitter to include
+    -- the enclosing scope start + any leading comments (e.g. docstrings)
+    get_window: (bufnr, line_num) =>
+        total_lines = api.nvim_buf_line_count(bufnr)
+        start_line = math.max(1, line_num - @window_radius)
+        end_line = math.min(total_lines, line_num + @window_radius)
+        max_window = 60  -- hard cap to avoid sending too much to the model
+
+        -- Try to extend window to include enclosing scope + leading comments
+        ok, parser = pcall(vim.treesitter.get_parser, bufnr)
+        if ok and parser
+            ok2, tree = pcall(-> parser\parse())
+            if ok2 and tree and tree[1]
+                root = tree[1]\root()
+                if root
+                    node = root\named_descendant_for_range(line_num - 1, 0, line_num - 1, 0)
+                    current = node
+                    while current
+                        if @_scope_types[current\type()]
+                            scope_start = current\start() + 1  -- 1-indexed
+
+                            -- Walk back over preceding comment siblings
+                            prev = current\prev_named_sibling()
+                            while prev and @_comment_types[prev\type()]
+                                scope_start = prev\start() + 1
+                                prev = prev\prev_named_sibling()
+
+                            -- Extend start_line upward if needed, capped at max_window
+                            if scope_start < start_line
+                                start_line = math.max(1, math.max(scope_start, end_line - max_window + 1))
+                            break
+                        current = current\parent()
+
+        lines = api.nvim_buf_get_lines(bufnr, start_line - 1, end_line, false)
+        return {
+            lines: lines
+            start_line: start_line
+            end_line: end_line
+            cursor_offset: line_num - start_line  -- 0-based offset of cursor within window
+        }
+
+    -- Snapshot the full buffer as "original" (call on InsertEnter)
+    -- We store all lines so we can later extract any window range,
+    -- keeping original_lines aligned with current_lines regardless of cursor movement.
+    snapshot_original: (bufnr) =>
+        bufnr = bufnr or api.nvim_get_current_buf()
+        return unless @is_valid_buffer(bufnr)
+
+        state = @buffer_states[bufnr] or {}
+        state.original_all_lines = api.nvim_buf_get_lines(bufnr, 0, -1, false)
+        state.bufnr = bufnr
+        state.filepath = api.nvim_buf_get_name(bufnr)
+        state.filetype = vim.bo[bufnr].filetype
+        @buffer_states[bufnr] = state
+
+    -- Update the current state (call on TextChangedI)
+    update_state: (bufnr) =>
+        bufnr = bufnr or api.nvim_get_current_buf()
+        return unless api.nvim_buf_is_valid(bufnr)
+
+        pos = api.nvim_win_get_cursor(0)
+        line_num = pos[1]
+        col = pos[2]
+
+        window = @get_window(bufnr, line_num)
+
+        -- Also get FIM context: current line + previous lines
+        line_content = api.nvim_buf_get_lines(bufnr, line_num - 1, line_num, false)[1] or ''
+        prev_start = math.max(1, line_num - 5)
+        prev_lines = api.nvim_buf_get_lines(bufnr, prev_start - 1, line_num - 1, false)
+
+        state = @buffer_states[bufnr] or {}
+        state.current_window = window
+        state.line_num = line_num
+        state.cursor_col = col
+        state.line_content = line_content
+        state.prev_lines = prev_lines
+        state.bufnr = bufnr
+        state.filepath = api.nvim_buf_get_name(bufnr)
+        state.filetype = vim.bo[bufnr].filetype
+        state.timestamp = vim.uv.hrtime()
+        @buffer_states[bufnr] = state
+
+    -- Get context for completion request
+    get_context: (bufnr) =>
+        bufnr = bufnr or api.nvim_get_current_buf()
+        state = @buffer_states[bufnr]
+        return nil unless state
+        return nil unless state.current_window
+
+        current = state.current_window
+
+        -- Extract original lines using the CURRENT window bounds.
+        -- This ensures original_lines and current_lines are always aligned
+        -- (same line range), so the model sees a clean diff, not phantom
+        -- additions/deletions from window boundary shifts.
+        original_lines = if state.original_all_lines
+            orig = {}
+            end_idx = math.min(current.end_line, #state.original_all_lines)
+            for i = current.start_line, end_idx
+                table.insert(orig, state.original_all_lines[i])
+            orig
+        else
+            current.lines  -- no original yet, treat current as original
+
+        {
+            bufnr: bufnr
+            filepath: state.filepath
+            filetype: state.filetype
+            line_num: state.line_num
+            cursor_col: state.cursor_col
+            -- FIM context
+            line_content: state.line_content
+            prev_lines: state.prev_lines
+            -- Window data for edit mode
+            original_lines: original_lines
+            current_lines: current.lines
+            window_start: current.start_line
+            window_end: current.end_line
+            cursor_offset: current.cursor_offset
+            timestamp: state.timestamp
+        }
+
+    clear_state: (bufnr) =>
+        if bufnr
+            @buffer_states[bufnr] = nil
+        else
+            @buffer_states = {}
+
+    -- Apply the model's updated lines to the buffer using diff hunks
+    -- This ensures only the changed lines are modified, matching the ghost text preview
+    apply_update: (bufnr, context, updated_lines) =>
+        bufnr = bufnr or api.nvim_get_current_buf()
+        return unless context and updated_lines and #updated_lines > 0
+
+        Diff = require('sweep.diff')
+        current_lines = context.current_lines or {}
+        result = Diff.diff(current_lines, updated_lines)
+
+        return unless result.has_changes
+
+        start_line = context.window_start
+
+        -- Apply hunks in reverse order so indices stay valid
+        for i = #result.hunks, 1, -1
+            hunk = result.hunks[i]
+            if hunk.first_old_idx
+                -- Buffer line = window offset + start_line - 1 (0-based for nvim API)
+                buf_line = start_line - 1 + hunk.first_old_idx - 1
+                -- Remove deleted lines, insert added lines
+                api.nvim_buf_set_lines(bufnr, buf_line, buf_line + #hunk.deletes, false, hunk.adds)
+            elseif hunk.first_new_idx
+                -- Pure insertion: insert at the corresponding position
+                buf_line = start_line - 1 + math.min(hunk.first_new_idx - 1, #current_lines)
+                api.nvim_buf_set_lines(bufnr, buf_line, buf_line, false, hunk.adds)
+
+        -- Re-snapshot as new original after accepting
+        @snapshot_original(bufnr)

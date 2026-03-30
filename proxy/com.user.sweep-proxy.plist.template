@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.user.sweep-proxy</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/path/to/python3</string>
+        <string>/path/to/sweep.nvim/proxy/sweep_proxy.py</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/path/to/sweep.nvim/proxy</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/Users/YOUR_USER/.local/state/nvim/sweep_proxy.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/YOUR_USER/.local/state/nvim/sweep_proxy.err</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/path/to/python/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+</dict>
+</plist>

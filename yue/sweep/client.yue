@@ -1,0 +1,524 @@
+-- Sweep Proxy Client
+-- Transport: Unix socket (preferred) → HTTP via vim.system (fallback)
+-- Supports both FIM (inline completion) and edit (next-edit prediction) modes
+
+uv = vim.uv
+
+-- Generate unique instance ID for this Neovim session
+INSTANCE_ID = "nvim_#{vim.fn.getpid()}_#{vim.uv.hrtime()}"
+
+-- Stop tokens per mode (match original sweep.nvim)
+FIM_STOP = {
+    '<|endoftext|>', '<|file_sep|>', '</s>',
+    '<|fim_prefix|>', '<|fim_suffix|>', '<|fim_middle|>'
+}
+EDIT_STOP = {'<|file_sep|>', '</s>'}
+
+export default class SweepClient
+    config: nil
+    -- Unix socket transport
+    pipe: nil
+    connected: false
+    connecting: false
+    read_buffer: ''
+    pending_callback: nil
+    sock_path: nil
+    -- State
+    transport: nil  -- 'socket' | 'http' | nil
+    retry_count: 0
+    max_retries: 3
+
+    new: (config) =>
+        @config = config
+        @pipe = nil
+        @connected = false
+        @connecting = false
+        @read_buffer = ''
+        @pending_callback = nil
+        @retry_count = 0
+        @max_retries = 3
+        @transport = nil
+
+        -- Determine socket path
+        xdg = os.getenv('XDG_RUNTIME_DIR')
+        if xdg
+            @sock_path = "#{xdg}/sweep.sock"
+        else
+            ok, uid = pcall(vim.uv.getuid)
+            unless ok
+                uid = vim.fn.system('id -u')\gsub('%s+', '')
+            @sock_path = "/tmp/sweep-#{uid}.sock"
+
+    -- ---------------------------------------------------------------
+    -- Logging
+    -- ---------------------------------------------------------------
+    log: (msg, level) =>
+        log_level = @config and @config.log_level or 'info'
+        if log_level == 'debug' or (level and level >= vim.log.levels.WARN)
+            pcall(vim.notify, "Sweep: #{msg}", level or vim.log.levels.INFO)
+
+    -- ---------------------------------------------------------------
+    -- Unix socket transport
+    -- ---------------------------------------------------------------
+    socket_connect: (callback) =>
+        return callback(true) if @connected
+        return if @connecting
+
+        unless uv.fs_stat(@sock_path)
+            callback(false, "Socket not found: #{@sock_path}")
+            return
+
+        @connecting = true
+        @pipe = uv.new_pipe(false)
+        self = @
+
+        @pipe\connect(@sock_path, (err) ->
+            self.connecting = false
+            if err
+                self.pipe\close() if self.pipe and not self.pipe\is_closing()
+                self.pipe = nil
+                self.connected = false
+                vim.schedule(-> callback(false, "Socket connect: #{err}"))
+            else
+                self.connected = true
+                self.transport = 'socket'
+                self.read_buffer = ''
+                self.pipe\read_start((read_err, data) ->
+                    if read_err or not data
+                        self.connected = false
+                        self.transport = nil
+                        if self.pipe and not self.pipe\is_closing()
+                            self.pipe\close()
+                        self.pipe = nil
+                        if self.pending_callback
+                            cb = self.pending_callback
+                            self.pending_callback = nil
+                            vim.schedule(-> cb(nil, "Connection lost"))
+                        return
+
+                    self.read_buffer ..= data
+                    while true
+                        nl = self.read_buffer\find('\n')
+                        break unless nl
+                        msg = self.read_buffer\sub(1, nl - 1)
+                        self.read_buffer = self.read_buffer\sub(nl + 1)
+                        ok, response = pcall(vim.json.decode, msg)
+                        if ok and self.pending_callback
+                            cb = self.pending_callback
+                            self.pending_callback = nil
+                            vim.schedule(-> cb(response, nil))
+                        elseif not ok and self.pending_callback
+                            cb = self.pending_callback
+                            self.pending_callback = nil
+                            vim.schedule(-> cb(nil, "JSON parse error"))
+                )
+                vim.schedule(->
+                    self\log("Connected via Unix socket")
+                    callback(true)
+                )
+        )
+
+    socket_send: (request, callback) =>
+        unless @connected and @pipe
+            callback(nil, "Not connected")
+            return
+
+        if @pending_callback
+            callback(nil, "Request already pending")
+            return
+
+        @pending_callback = callback
+        data = vim.json.encode(request) .. '\n'
+        ok, err = pcall(-> @pipe\write(data))
+        unless ok
+            @pending_callback = nil
+            @connected = false
+            @transport = nil
+            callback(nil, "Write failed: #{err}")
+
+    -- ---------------------------------------------------------------
+    -- HTTP transport (fallback)
+    -- ---------------------------------------------------------------
+    http_send: (request, callback) =>
+        url = "#{@config.provider.url}/v1/completions"
+        -- Build request body with all fields
+        body_dict = {
+            prompt: request.prompt
+            max_tokens: request.max_tokens
+            temperature: request.temperature
+            top_p: request.top_p
+            top_k: request.top_k
+            repeat_penalty: request.repeat_penalty
+            stop: request.stop
+            stream: false
+            mode: request.mode
+            instance_id: request.instance_id
+            timeout: request.timeout
+        }
+        -- Add mode-specific fields
+        if request.mode == 'fim'
+            body_dict.suffix_lines = request.suffix_lines
+            body_dict.max_lines = request.max_lines
+        else
+            body_dict.current_lines = request.current_lines
+            body_dict.cursor_offset = request.cursor_offset
+            body_dict.proximity = request.proximity
+
+        body = vim.json.encode(body_dict)
+
+        -- Use request-specific timeout or config default
+        timeout = request.timeout or @config.provider.completion_timeout or 5000
+
+        vim.system(
+            {'curl', '-s', '-X', 'POST', url,
+             '-H', 'Content-Type: application/json',
+             '-d', body,
+             '--connect-timeout', '2',
+             '--max-time', tostring(math.floor(timeout / 1000))
+            },
+            {},
+            vim.schedule_wrap((result) ->
+                if result.code ~= 0
+                    callback(nil, "HTTP failed (curl exit #{result.code})")
+                    return
+
+                ok, response = pcall(vim.json.decode, result.stdout)
+                unless ok
+                    callback(nil, "HTTP JSON parse error")
+                    return
+
+                -- Handle new response format
+                if response.error
+                    callback(nil, response.error)
+                    return
+
+                -- Return response as-is for unified handling
+                callback(response, nil)
+            )
+        )
+
+    -- ---------------------------------------------------------------
+    -- Unified send
+    -- ---------------------------------------------------------------
+    send: (request, callback) =>
+        -- If on HTTP fallback, periodically retry socket
+        if @transport == 'http'
+            @_http_request_count = (@_http_request_count or 0) + 1
+            if @_http_request_count >= 20
+                @_http_request_count = 0
+                @transport = nil  -- Allow socket retry
+            else
+                @http_send(request, callback)
+                return
+
+        if @connected and @transport == 'socket'
+            @socket_send(request, callback)
+            return
+
+        @socket_connect((ok, err) ->
+            if ok
+                @socket_send(request, callback)
+            else
+                @log("Socket unavailable (#{err}), using HTTP fallback")
+                @transport = 'http'
+                @_http_request_count = 0
+                @http_send(request, callback)
+        )
+
+    disconnect: () =>
+        if @pipe and not @pipe\is_closing()
+            @pipe\read_stop() if @connected
+            @pipe\close()
+        @pipe = nil
+        @connected = false
+        @transport = nil
+        @pending_callback = nil
+        @read_buffer = ''
+
+    -- ---------------------------------------------------------------
+    -- Public API
+    -- ---------------------------------------------------------------
+    health_check: () =>
+        if @transport == 'http' or not uv.fs_stat(@sock_path)
+            vim.system(
+                {'curl', '-s', "#{@config.provider.url}/health", '--connect-timeout', '2'},
+                {},
+                vim.schedule_wrap((result) ->
+                    if result.code == 0
+                        @log("Sweep proxy is healthy (HTTP)", vim.log.levels.INFO)
+                        @transport = 'http'
+                    else
+                        @log("Sweep proxy not responding", vim.log.levels.WARN)
+                )
+            )
+        else
+            @send({ type: 'health' }, (response, err) ->
+                if err
+                    @log("Proxy not responding: #{err}", vim.log.levels.WARN)
+                elseif response and response.status == 'ok'
+                    @log("Sweep proxy is healthy (socket)", vim.log.levels.INFO)
+            )
+
+    -- FIM completion: inline text at cursor position
+    -- Returns a string completion via callback(text, err)
+    request_completion: (mode, context, tracker, callback) =>
+        return callback(nil, "No context") unless context and callback
+
+        mode = mode or 'fim'
+        provider = @config.provider
+
+        local prompt, stop, max_tokens
+        if mode == 'fim'
+            prompt = @build_fim_prompt(context)
+            stop = FIM_STOP
+            max_tokens = provider.fim_max_tokens or 128
+        else
+            prompt = @build_edit_prompt(context, tracker)
+            stop = EDIT_STOP
+            max_tokens = provider.max_tokens or 512
+
+        unless prompt
+            -- Edit mode returns nil when there are no changes - this is expected
+            if mode == 'edit'
+                callback(nil, nil)  -- Silent no-op
+            else
+                callback(nil, "Failed to build prompt")
+            return
+
+        @log("Requesting #{mode} completion (#{@transport or 'auto'}, prompt #{#prompt} chars)")
+
+        timeout = if mode == 'edit' then 15000 else provider.completion_timeout or 5000
+
+        @log("Sending params: temp=#{provider.temperature}, top_p=#{provider.top_p}, top_k=#{provider.top_k}, penalty=#{provider.repeat_penalty}")
+
+        -- Prepare mode-specific parameters
+        suffix_lines = nil
+        max_lines_param = nil
+        current_lines_param = nil
+        cursor_offset_param = nil
+        proximity_param = nil
+
+        if mode == 'fim'
+            suffix_lines = @get_suffix_lines(context)
+            max_lines_param = provider.max_fim_lines or 21
+        else
+            current_lines_param = context.current_lines
+            cursor_offset_param = context.cursor_offset
+            proximity_param = 8
+
+        @send({
+            type: 'completion'
+            instance_id: INSTANCE_ID
+            mode: mode
+            prompt: prompt
+            max_tokens: max_tokens
+            temperature: provider.temperature
+            top_p: provider.top_p
+            top_k: provider.top_k
+            repeat_penalty: provider.repeat_penalty
+            stop: stop
+            timeout: timeout
+            suffix_lines: suffix_lines
+            max_lines: max_lines_param
+            current_lines: current_lines_param
+            cursor_offset: cursor_offset_param
+            proximity: proximity_param
+        }, (response, err) ->
+            if err
+                @handle_error(err, mode, context, tracker, callback)
+                return
+
+            if response and response.error
+                @handle_error(response.error, mode, context, tracker, callback)
+                return
+
+            @retry_count = 0
+
+            if mode == 'fim'
+                text = response and tostring(response.text) or ''
+                if #text > 0
+                    @log("Got #{#text} chars from model (#{mode})")
+                    callback(text, nil)
+                else
+                    callback(nil, nil)
+            else
+                updated_lines = response and response.updated_lines or {}
+                -- Ensure updated_lines is a table of strings
+                @log("Edit response: #{vim.inspect(response)}")
+                if type(updated_lines) == 'table' and #updated_lines > 0
+                    @log("Got #{#updated_lines} lines from model (#{mode})")
+                    callback(updated_lines, nil)
+                else
+                    @log("Empty edit response from model", vim.log.levels.WARN)
+                    callback(nil, nil)
+        )
+
+    handle_error: (err, mode, context, tracker, callback) =>
+        if @retry_count < @max_retries
+            @retry_count += 1
+            delay = math.pow(2, @retry_count) * 100
+            @log("Retry #{@retry_count}/#{@max_retries} in #{delay}ms: #{err}")
+            if @transport == 'socket'
+                @disconnect()
+            vim.defer_fn((-> @request_completion(mode, context, tracker, callback)), delay)
+        else
+            @retry_count = 0
+            @log("Max retries exceeded: #{err}", vim.log.levels.WARN)
+            callback(nil, err)
+
+    -- ---------------------------------------------------------------
+    -- FIM Prompt: inline completion at cursor
+    -- Uses the full trimmed window (lines before + after cursor)
+    -- to match the original sweep.nvim format
+    -- ---------------------------------------------------------------
+    build_fim_prompt: (context) =>
+        current_lines = context.current_lines or {}
+        cursor_offset = context.cursor_offset or 0
+        current_line = context.line_content or ''
+        cursor_col = context.cursor_col or 0
+
+        before_cursor = string.sub(current_line, 1, cursor_col)
+        after_cursor = string.sub(current_line, cursor_col + 1)
+
+        -- Build prefix: all window lines before cursor + text before cursor
+        prefix_parts = {}
+        for i = 1, cursor_offset
+            table.insert(prefix_parts, current_lines[i])
+        table.insert(prefix_parts, before_cursor)
+        prefix = table.concat(prefix_parts, "\n")
+
+        -- Build suffix: text after cursor + all window lines after cursor
+        suffix_parts = {after_cursor}
+        for i = cursor_offset + 2, #current_lines
+            table.insert(suffix_parts, current_lines[i])
+        suffix = table.concat(suffix_parts, "\n")
+
+        "<|fim_prefix|>#{prefix}<|fim_suffix|>#{suffix}<|fim_middle|>"
+
+    -- Get the suffix lines (lines after cursor in the window) for overlap detection
+    get_suffix_lines: (context) =>
+        current_lines = context.current_lines or {}
+        cursor_offset = context.cursor_offset or 0
+        after_cursor = string.sub(context.line_content or '', (context.cursor_col or 0) + 1)
+        result = {}
+        table.insert(result, after_cursor) if #after_cursor > 0
+        for i = cursor_offset + 2, #current_lines
+            table.insert(result, current_lines[i])
+        return result
+
+    -- ---------------------------------------------------------------
+    -- Edit Prompt: next-edit prediction with diff context
+    -- Format matches: https://blog.sweep.dev/posts/oss-next-edit
+    -- ---------------------------------------------------------------
+    build_edit_prompt: (context, tracker) =>
+        parts = {}
+        filepath = context.filepath or 'buffer'
+
+        cwd = vim.fn.getcwd()
+        if filepath\sub(1, #cwd) == cwd
+            filepath = filepath\sub(#cwd + 2)
+
+        original_lines = context.original_lines or {}
+        current_lines = context.current_lines or {}
+
+        -- Check if there's any edit signal for the model to work with
+        has_diff_history = tracker and #tracker.edit_history > 0
+        has_buffer_changes = false
+        if #original_lines == #current_lines
+            for i = 1, #original_lines
+                if original_lines[i] ~= current_lines[i]
+                    has_buffer_changes = true
+                    break
+        else
+            has_buffer_changes = true
+
+        -- Note: We allow edit mode to proceed even without diff history
+        -- The model can suggest improvements based on current code context
+
+        -- 1. Context files from recently visited buffers
+        if tracker
+            ctx_files = tracker\get_context_files(context.bufnr)
+            for _, cf in ipairs(ctx_files)
+                table.insert(parts, "<|file_sep|>#{cf.filepath}")
+                for _, line in ipairs(cf.lines)
+                    table.insert(parts, line)
+
+        -- 2. Recent edit diffs
+        if tracker
+            diff_sections = tracker\get_diff_sections()
+            for _, section in ipairs(diff_sections)
+                table.insert(parts, section)
+
+        -- 3. Treesitter context (enclosing scope + imports)
+        ts_context = @get_treesitter_context(context)
+        if ts_context
+            table.insert(parts, "<|file_sep|>context/treesitter")
+            table.insert(parts, ts_context)
+
+        -- 4. Original window
+        if #original_lines > 0
+            table.insert(parts, "<|file_sep|>original/#{filepath}")
+            for _, line in ipairs(original_lines)
+                table.insert(parts, line)
+
+        -- 5. Current code block
+        if #current_lines > 0
+            table.insert(parts, "<|file_sep|>current/#{filepath}")
+            for _, line in ipairs(current_lines)
+                table.insert(parts, line)
+
+        -- 6. Updated section for model to generate
+        table.insert(parts, "<|file_sep|>updated/#{filepath}")
+
+        return table.concat(parts, '\n')
+
+    -- Get treesitter context: enclosing scope signature + imports
+    get_treesitter_context: (context) =>
+        bufnr = context.bufnr
+        return nil unless bufnr and vim.api.nvim_buf_is_valid(bufnr)
+
+        ok, parser = pcall(vim.treesitter.get_parser, bufnr)
+        return nil unless ok and parser
+
+        ok2, tree = pcall(-> parser\parse())
+        return nil unless ok2 and tree and tree[1]
+
+        root = tree[1]\root()
+        return nil unless root
+
+        line_num = context.line_num or 1
+        col = context.cursor_col or 0
+
+        parts = {}
+
+        -- Find enclosing scope (function/method/class)
+        node = root\named_descendant_for_range(line_num - 1, col, line_num - 1, col)
+        scope_types = {
+            'function_declaration': true, 'function_definition': true
+            'method_declaration': true, 'method_definition': true
+            'class_declaration': true, 'class_definition': true
+            'function_item': true, 'impl_item': true
+        }
+
+        current = node
+        while current
+            ntype = current\type()
+            if scope_types[ntype]
+                start_row = current\start()
+                scope_line = vim.api.nvim_buf_get_lines(bufnr, start_row, start_row + 1, false)[1]
+                if scope_line
+                    table.insert(parts, "Enclosing scope: #{scope_line}")
+                break
+            current = current\parent()
+
+        -- Collect import lines from top of file
+        lines = vim.api.nvim_buf_get_lines(bufnr, 0, math.min(50, vim.api.nvim_buf_line_count(bufnr)), false)
+        import_patterns = {'^import ', '^from ', '^require', '^use ', '^#include', '^using '}
+        for _, line in ipairs(lines)
+            for _, pat in ipairs(import_patterns)
+                if line\match(pat)
+                    table.insert(parts, "Import: #{line}")
+                    break
+
+        return #parts > 0 and table.concat(parts, '\n') or nil
+

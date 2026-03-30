@@ -1,0 +1,287 @@
+-- Completion UI Rendering
+-- Supports both FIM (inline ghost text) and edit (diff-based) modes
+
+api = vim.api
+Diff = require('sweep.diff')
+
+export default class GhostText
+    config: nil
+    ns_id: nil
+    visible: false
+    blink_menu_visible: false
+    show_time: 0
+    -- Current state
+    mode: nil           -- 'fim' | 'edit'
+    current_bufnr: nil
+    current_line: nil
+    current_col: nil
+    -- FIM mode state
+    current_completion: nil
+    -- Edit mode state
+    current_context: nil
+    current_updated_lines: nil
+    current_diff: nil
+    -- Extmark tracking
+    extmark_ids: {}
+
+    new: (config) =>
+        @config = config
+        @ns_id = api.nvim_create_namespace('sweep_ghost')
+        @visible = false
+        @blink_menu_visible = false
+        @show_time = 0
+        @mode = nil
+        @current_bufnr = nil
+        @current_line = nil
+        @current_col = nil
+        @current_completion = nil
+        @current_context = nil
+        @current_updated_lines = nil
+        @current_diff = nil
+        @extmark_ids = {}
+        @setup_blink_listeners() if config.blink.enabled
+
+    -- ---------------------------------------------------------------
+    -- FIM mode: show inline ghost text at cursor
+    -- ---------------------------------------------------------------
+    show_fim: (completion, context) =>
+        return unless completion and #completion > 0
+        return unless context
+        return if @should_hide_for_blink()
+
+        @hide()
+
+        bufnr = context.bufnr or api.nvim_get_current_buf()
+        line_num = context.line_num or api.nvim_win_get_cursor(0)[1]
+        col = context.cursor_col or api.nvim_win_get_cursor(0)[2]
+
+        -- Clamp column
+        line = api.nvim_buf_get_lines(bufnr, line_num - 1, line_num, false)[1] or ''
+        col = math.min(col, #line)
+
+        -- Split completion into lines
+        comp_lines = vim.split(completion, '\n')
+        first_line = comp_lines[1] or ''
+        return unless #first_line > 0 or #comp_lines > 1
+
+        @mode = 'fim'
+        @current_completion = completion
+        @current_bufnr = bufnr
+        @current_line = line_num
+        @current_col = col
+
+        -- Build extmark options
+        extmark_opts = {
+            virt_text: {{first_line, 'SweepCompletion'}}
+            virt_text_pos: 'inline'
+            hl_mode: 'combine'
+        }
+
+        -- Multi-line: add virtual lines below
+        if #comp_lines > 1
+            virt_lines = {}
+            for i = 2, #comp_lines
+                table.insert(virt_lines, {{comp_lines[i], 'SweepCompletion'}})
+            extmark_opts.virt_lines = virt_lines
+
+        id = api.nvim_buf_set_extmark(bufnr, @ns_id, line_num - 1, col, extmark_opts)
+        table.insert(@extmark_ids, id)
+        @visible = true
+        @show_time = vim.uv.hrtime()
+
+    -- ---------------------------------------------------------------
+    -- Edit mode: show diff-based changes
+    -- ---------------------------------------------------------------
+    show_edit: (updated_lines, context) =>
+        return unless updated_lines and #updated_lines > 0
+        return unless context
+        return if @should_hide_for_blink()
+
+        current_lines = context.current_lines or {}
+        diff_result = Diff.diff(current_lines, updated_lines)
+        return unless diff_result.has_changes
+
+        @hide()
+
+        @mode = 'edit'
+        @current_context = context
+        @current_updated_lines = updated_lines
+        @current_diff = diff_result
+        @current_bufnr = context.bufnr or api.nvim_get_current_buf()
+        @current_line = context.line_num
+        @current_col = context.cursor_col
+
+        window_start = context.window_start or 1
+
+        for _, hunk in ipairs(diff_result.hunks)
+            @render_hunk(hunk, window_start)
+
+        if #@extmark_ids > 0
+            @visible = true
+            @show_time = vim.uv.hrtime()
+
+    render_hunk: (hunk, window_start) =>
+        bufnr = @current_bufnr
+        has_deletes = #hunk.deletes > 0
+        has_adds = #hunk.adds > 0
+
+        if has_deletes and has_adds
+            @render_modification(hunk, window_start, bufnr)
+        elseif has_deletes
+            @render_deletion(hunk, window_start, bufnr)
+        elseif has_adds
+            @render_addition(hunk, window_start, bufnr)
+
+    render_modification: (hunk, window_start, bufnr) =>
+        total_lines = api.nvim_buf_line_count(bufnr)
+        if hunk.first_old_idx
+            for i = 0, #hunk.deletes - 1
+                -- Convert 1-indexed array position to 0-indexed buffer line
+                -- window_start is 1-indexed buffer line, subtract 1 for 0-indexed
+                -- hunk.first_old_idx is 1-indexed position in window array, subtract 1
+                -- i is 0-indexed offset from first deletion
+                buf_line = (window_start - 1) + (hunk.first_old_idx - 1) + i
+                if buf_line >= 0 and buf_line < total_lines
+                    line_text = api.nvim_buf_get_lines(bufnr, buf_line, buf_line + 1, false)[1] or ''
+                    id = api.nvim_buf_set_extmark(bufnr, @ns_id, buf_line, 0, {
+                        end_row: buf_line
+                        end_col: #line_text
+                        hl_group: 'SweepDeletion'
+                        hl_mode: 'combine'
+                    })
+                    table.insert(@extmark_ids, id)
+
+        if #hunk.adds > 0
+            -- Place virtual lines after the last deleted line (or at first_old_idx if no deletes)
+            -- For virt_lines, anchor is the line AFTER which to insert
+            anchor = (window_start - 1) + (hunk.first_old_idx or 1) - 1 + #hunk.deletes - 1
+            anchor = math.max(0, math.min(anchor, total_lines - 1))
+
+            virt_lines = {}
+            for _, add_line in ipairs(hunk.adds)
+                -- Empty strings don't render in virt_lines, use a space instead
+                display_line = #add_line > 0 and add_line or ' '
+                table.insert(virt_lines, {{display_line, 'SweepAddition'}})
+
+            id = api.nvim_buf_set_extmark(bufnr, @ns_id, anchor, 0, {
+                virt_lines: virt_lines
+                virt_lines_above: false
+                hl_mode: 'combine'
+            })
+            table.insert(@extmark_ids, id)
+
+    render_deletion: (hunk, window_start, bufnr) =>
+        total_lines = api.nvim_buf_line_count(bufnr)
+        if hunk.first_old_idx
+            for i = 0, #hunk.deletes - 1
+                -- Convert 1-indexed array position to 0-indexed buffer line
+                buf_line = (window_start - 1) + (hunk.first_old_idx - 1) + i
+                if buf_line >= 0 and buf_line < total_lines
+                    line_text = api.nvim_buf_get_lines(bufnr, buf_line, buf_line + 1, false)[1] or ''
+                    id = api.nvim_buf_set_extmark(bufnr, @ns_id, buf_line, 0, {
+                        end_row: buf_line
+                        end_col: #line_text
+                        hl_group: 'SweepDeletion'
+                        hl_mode: 'combine'
+                    })
+                    table.insert(@extmark_ids, id)
+
+    render_addition: (hunk, window_start, bufnr) =>
+        total_lines = api.nvim_buf_line_count(bufnr)
+        -- hunk.first_new_idx is 1-indexed position in updated_lines array
+        -- For pure additions, place virtual lines after the line at new_idx - 1
+        -- Anchor is the line AFTER which to insert virtual lines
+        anchor = (window_start - 1) + (hunk.first_new_idx or 1) - 1 - 1
+        anchor = math.max(0, math.min(anchor, total_lines - 1))
+
+        virt_lines = {}
+        for _, add_line in ipairs(hunk.adds)
+            -- Empty strings don't render in virt_lines, use a space instead
+            display_line = #add_line > 0 and add_line or ' '
+            table.insert(virt_lines, {{display_line, 'SweepAddition'}})
+
+        id = api.nvim_buf_set_extmark(bufnr, @ns_id, anchor, 0, {
+            virt_lines: virt_lines
+            virt_lines_above: false
+            hl_mode: 'combine'
+        })
+        table.insert(@extmark_ids, id)
+
+    -- ---------------------------------------------------------------
+    -- Common
+    -- ---------------------------------------------------------------
+    hide: () =>
+        if @current_bufnr and api.nvim_buf_is_valid(@current_bufnr)
+            for _, id in ipairs(@extmark_ids)
+                pcall(api.nvim_buf_del_extmark, @current_bufnr, @ns_id, id)
+        elseif #@extmark_ids > 0
+            pcall(api.nvim_buf_clear_namespace, 0, @ns_id, 0, -1)
+
+        @extmark_ids = {}
+        @mode = nil
+        @current_completion = nil
+        @current_context = nil
+        @current_updated_lines = nil
+        @current_diff = nil
+        @current_bufnr = nil
+        @current_line = nil
+        @current_col = nil
+        @visible = false
+
+    -- Get data needed for acceptance
+    get_completion_data: () =>
+        return nil unless @visible
+        if @mode == 'fim'
+            return { mode: 'fim', completion: @current_completion }
+        elseif @mode == 'edit'
+            return { mode: 'edit', updated_lines: @current_updated_lines, context: @current_context }
+        return nil
+
+    get_current_completion: () =>
+        return @current_completion if @visible and @mode == 'fim'
+        return @current_updated_lines if @visible and @mode == 'edit'
+        return nil
+
+    has_completion: () => @visible
+
+    has_cursor_prediction: () => @visible and @mode == 'edit'
+
+    is_fresh: () =>
+        return false unless @visible
+        elapsed_ms = (vim.uv.hrtime() - @show_time) / 1e6
+        return elapsed_ms < 100
+
+    get_position: () =>
+        return nil unless @visible
+        return { line: @current_line, col: @current_col }
+
+    ensure_close_all: () =>
+        @hide()
+        pcall(api.nvim_buf_clear_namespace, 0, @ns_id, 0, -1)
+
+    should_hide_for_blink: () =>
+        return false unless @config.blink.enabled
+        return @blink_menu_visible
+
+    setup_blink_listeners: () =>
+        return unless @config.blink.enabled
+
+        api.nvim_create_autocmd('User', {
+            pattern: 'BlinkCmpMenuOpen'
+            callback: ->
+                @blink_menu_visible = true
+                @hide()
+        })
+
+        api.nvim_create_autocmd('User', {
+            pattern: 'BlinkCmpMenuClose'
+            callback: ->
+                @blink_menu_visible = false
+        })
+
+        api.nvim_create_autocmd('User', {
+            pattern: 'BlinkCmpAccept'
+            callback: ->
+                @blink_menu_visible = false
+                @hide()
+        })

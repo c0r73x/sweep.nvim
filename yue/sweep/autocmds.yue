@@ -1,0 +1,253 @@
+-- Autocommand Setup
+
+api = vim.api
+
+-- Safely stop and close a uv timer, handling already-closed handles
+-- _debounce_timer may be: nil, a uv_timer_t handle, or `true` (sentinel
+-- left by CursorHold to prevent re-triggering while stationary).
+stop_timer = (ct) ->
+    timer = ct._debounce_timer
+    ct._debounce_timer = nil
+    if timer and type(timer) == 'userdata'
+        pcall(->
+            unless timer\is_closing()
+                timer\stop()
+                timer\close()
+        )
+
+-- Callback functions
+text_changed_callback = () ->
+    ct = _G.sweep
+    return unless ct and ct.config.enabled
+
+    delay = ct.config.behavior.text_change_debounce
+    bufnr = api.nvim_get_current_buf()
+
+    -- Stop existing debounce timer
+    stop_timer(ct)
+
+    -- Update buffer state immediately so context is fresh
+    ct.buffer_state\update_state(bufnr)
+
+    if delay > 0
+        timer = vim.uv.new_timer()
+        timer\start(delay, 0, vim.schedule_wrap(->
+            timer\stop()
+            if not timer\is_closing()
+                timer\close()
+            ct._debounce_timer = nil
+            ct\trigger_completion(bufnr)
+        ))
+        ct._debounce_timer = timer
+    else
+        ct\trigger_completion(bufnr)
+
+insert_enter_callback = () ->
+    ct = _G.sweep
+    return unless ct
+    bufnr = api.nvim_get_current_buf()
+    -- Clear any existing edit predictions when entering insert mode
+    ct\reject()
+    -- Snapshot original state for sweep prompt (original vs current)
+    ct.buffer_state\snapshot_original(bufnr)
+    ct.buffer_state\update_state(bufnr)
+
+insert_leave_callback = () ->
+    ct = _G.sweep
+    return unless ct
+    -- Clear all ghost text when leaving insert mode
+    ct\reject()
+    -- Also clear any pending debounce timers
+    stop_timer(ct)
+
+mode_changed_callback = () ->
+    ct = _G.sweep
+    return unless ct
+    mode = vim.api.nvim_get_mode().mode
+    -- Clear ghost text when entering normal/visual/command modes
+    -- Ghost text should only appear in insert mode
+    if mode ~= 'i'
+        ct\reject()
+
+cursor_moved_normal_callback = () ->
+    ct = _G.sweep
+    return unless ct and ct.config.enabled
+
+    -- Hide edit predictions when cursor moves (only in normal mode)
+    mode = vim.api.nvim_get_mode().mode
+    if mode == 'n' and ct.config.behavior.hide_on_cursor_move
+        ct\reject()
+    
+    -- Clear debounce timer when cursor moves
+    stop_timer(ct)
+
+cursor_hold_callback = () ->
+    ct = _G.sweep
+    return unless ct and ct.config.enabled
+
+    -- Only trigger edit prediction if:
+    -- 1. We're in normal mode
+    -- 2. No edit prediction is currently showing
+    -- 3. Not already processing a request
+    mode = vim.api.nvim_get_mode().mode
+    return unless mode == 'n'
+    return if ct\is_processing()
+    return if ct.ghost_text\has_cursor_prediction()
+    
+    -- Don't trigger if we already have a pending timer
+    return if ct._debounce_timer
+
+    -- Use edit prediction delay (default 1000ms)
+    delay = ct.config.behavior.edit_prediction_delay or 1000
+
+    bufnr = api.nvim_get_current_buf()
+    -- Only snapshot if we don't already have one from InsertEnter.
+    -- Overwriting would make original == current, losing the pre-edit baseline.
+    state = ct.buffer_state.buffer_states[bufnr]
+    unless state and state.original_all_lines
+        ct.buffer_state\snapshot_original(bufnr)
+    ct.buffer_state\update_state(bufnr)
+
+    timer = vim.uv.new_timer()
+    timer\start(delay, 0, vim.schedule_wrap(->
+        timer\stop()
+        if not timer\is_closing()
+            timer\close()
+        -- Replace handle with sentinel so stop_timer() won't call
+        -- methods on a closed handle, but the truthy value still
+        -- prevents re-triggering while the cursor is stationary.
+        ct._debounce_timer = true
+        -- Double-check we're still in normal mode and not processing
+        if vim.api.nvim_get_mode().mode == 'n' and not ct\is_processing()
+            ct\trigger_completion(bufnr)
+    ))
+    ct._debounce_timer = timer
+
+buf_enter_callback = () ->
+    ct = _G.sweep
+    return unless ct
+    bufnr = api.nvim_get_current_buf()
+    -- Attach tracker to this buffer (tracks line changes for edit history)
+    ct.tracker\attach(bufnr)
+    -- Record as recently visited for context files
+    ct.tracker\track_visit(bufnr)
+    ct.buffer_state\update_state(bufnr)
+
+buf_leave_callback = () ->
+    ct = _G.sweep
+    return unless ct
+    -- Only clear transient window state, preserve original_all_lines
+    -- so edit mode retains its baseline across buffer switches
+    bufnr = api.nvim_get_current_buf()
+    state = ct.buffer_state.buffer_states[bufnr]
+    if state
+        state.current_window = nil
+
+-- Check port availability asynchronously
+check_port_listening = (port, on_listening, on_free) ->
+    client = vim.uv.new_tcp()
+    client\connect('127.0.0.1', port, (err) ->
+        if err
+            client\close()
+            vim.schedule(on_free) if on_free
+        else
+            client\close()
+            vim.schedule(on_listening) if on_listening
+    )
+
+proxy_exit_callback = (job_id, code) ->
+    if code ~= 0
+        ct = _G.sweep
+        proxy_url = ct and ct.config.provider.url or 'http://127.0.0.1:5555'
+        url_parts = vim.split(proxy_url, '://')[2]
+        port = tonumber(vim.split(url_parts, ':')[2]) or 5555
+
+        check_port_listening(port,
+            (-> return),
+            (-> vim.notify("Sweep: Sweep proxy exited - model file not found or dependencies missing", vim.log.levels.WARN))
+        )
+
+very_lazy_callback = () ->
+    ct = _G.sweep
+    return unless ct and ct.config.enabled
+
+    unless ct.config.provider.auto_start
+        ct.client\health_check()
+        return
+
+    proxy_url = ct.config.provider.url
+    url_parts = vim.split(proxy_url, '://')[2]
+    port = tonumber(vim.split(url_parts, ':')[2]) or 5555
+
+    check_port_listening(port,
+        (->
+            -- Proxy already running, warm up connection with health check
+            ct.client\health_check()
+        ),
+        (->
+            proxy_script = ct.config.provider.proxy_script
+            if vim.uv.fs_stat(proxy_script)
+                vim.fn.jobstart({'python3', proxy_script}, {
+                    detach: true
+                    on_exit: proxy_exit_callback
+                })
+                -- Give proxy time to start, then warm up
+                vim.defer_fn((-> ct.client\health_check()), 2000)
+        )
+    )
+
+export default {
+    setup_autocmds: (sweep) ->
+        augroup = api.nvim_create_augroup('sweep', { clear: true })
+
+        api.nvim_create_autocmd('TextChangedI', {
+            group: augroup
+            callback: text_changed_callback
+        })
+
+        api.nvim_create_autocmd('InsertEnter', {
+            group: augroup
+            callback: insert_enter_callback
+        })
+
+        api.nvim_create_autocmd('InsertLeave', {
+            group: augroup
+            callback: insert_leave_callback
+        })
+
+        api.nvim_create_autocmd('ModeChanged', {
+            group: augroup
+            callback: mode_changed_callback
+        })
+
+        api.nvim_create_autocmd('CursorHold', {
+            group: augroup
+            callback: cursor_hold_callback
+        })
+
+        api.nvim_create_autocmd('CursorMoved', {
+            group: augroup
+            callback: cursor_moved_normal_callback
+        })
+
+        api.nvim_create_autocmd('BufEnter', {
+            group: augroup
+            callback: buf_enter_callback
+        })
+
+        api.nvim_create_autocmd('BufLeave', {
+            group: augroup
+            callback: buf_leave_callback
+        })
+
+        api.nvim_create_autocmd('User', {
+            group: augroup
+            pattern: 'VeryLazy'
+            callback: very_lazy_callback
+        })
+
+        -- If VeryLazy already fired (plugin loaded by VeryLazy event),
+        -- the autocmd above will never trigger. Run startup logic now.
+        if vim.v.vim_did_enter == 1
+            vim.schedule(very_lazy_callback)
+}

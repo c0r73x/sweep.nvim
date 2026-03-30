@@ -1,0 +1,89 @@
+-- Completion Caching Layer (LRU Cache)
+
+export default class CompletionCache
+    config: nil
+    cache: {}
+    size: 0
+    max_size: 100
+    ttl: 5000 -- 5 seconds in ms
+    total_hits: 0
+    total_misses: 0
+
+    new: (config) =>
+        @config = config
+        @cache = {}
+        @size = 0
+        @max_size = 100
+        @ttl = 5000
+        @total_hits = 0
+        @total_misses = 0
+
+    get: (key) =>
+        entry = @cache[key]
+        unless entry
+            @total_misses += 1
+            return nil
+
+        -- Check TTL
+        now = vim.uv.hrtime() / 1e6
+        if (now - entry.timestamp) > @ttl
+            @invalidate(key)
+            @total_misses += 1
+            return nil
+
+        entry.last_access = now
+        @total_hits += 1
+        return entry.completion
+
+    set: (key, completion) =>
+        now = vim.uv.hrtime() / 1e6
+
+        -- If key already exists, just update it
+        if @cache[key]
+            @cache[key] = {
+                completion: completion
+                timestamp: now
+                last_access: now
+            }
+            return
+
+        -- Evict oldest if at capacity
+        if @size >= @max_size
+            @evict_oldest()
+
+        @cache[key] = {
+            completion: completion
+            timestamp: now
+            last_access: now
+        }
+        @size += 1
+
+    invalidate: (key) =>
+        if @cache[key]
+            @cache[key] = nil
+            @size -= 1
+
+    clear: () =>
+        @cache = {}
+        @size = 0
+
+    evict_oldest: () =>
+        oldest_key = nil
+        oldest_time = math.huge
+
+        for key, entry in pairs(@cache)
+            if entry.last_access < oldest_time
+                oldest_time = entry.last_access
+                oldest_key = key
+
+        if oldest_key
+            @invalidate(oldest_key)
+
+    stats: () =>
+        total_requests = @total_hits + @total_misses
+        {
+            size: @size
+            hits: @total_hits
+            misses: @total_misses
+            hit_rate: total_requests > 0 and (@total_hits / total_requests) or 0
+        }

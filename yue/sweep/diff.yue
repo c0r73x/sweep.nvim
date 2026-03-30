@@ -1,0 +1,110 @@
+-- Line-level diff for small windows (≤21 lines)
+-- Uses LCS to compute minimal edit operations
+
+-- Compute LCS table for two arrays of lines
+compute_lcs = (a, b) ->
+    m, n = #a, #b
+    -- dp[i][j] = LCS length of a[1..i] and b[1..j]
+    dp = {}
+    for i = 0, m
+        dp[i] = {}
+        for j = 0, n
+            if i == 0 or j == 0
+                dp[i][j] = 0
+            elseif a[i] == b[j]
+                dp[i][j] = dp[i-1][j-1] + 1
+            else
+                dp[i][j] = math.max(dp[i-1][j], dp[i][j-1])
+    return dp
+
+-- Backtrack LCS table to produce edit operations
+backtrack = (dp, a, b) ->
+    ops = {}
+    i, j = #a, #b
+
+    while i > 0 or j > 0
+        if i > 0 and j > 0 and a[i] == b[j]
+            table.insert(ops, 1, { type: 'equal', old_idx: i, new_idx: j, text: a[i] })
+            i -= 1
+            j -= 1
+        elseif j > 0 and (i == 0 or dp[i][j-1] >= dp[i-1][j])
+            table.insert(ops, 1, { type: 'add', new_idx: j, text: b[j] })
+            j -= 1
+        else
+            table.insert(ops, 1, { type: 'delete', old_idx: i, text: a[i] })
+            i -= 1
+
+    return ops
+
+-- Group consecutive operations into hunks for easier rendering
+group_hunks = (ops) ->
+    hunks = {}
+    current_hunk = nil
+
+    for _, op in ipairs(ops)
+        if op.type == 'equal'
+            if current_hunk
+                table.insert(hunks, current_hunk)
+                current_hunk = nil
+        else
+            unless current_hunk
+                current_hunk = { deletes: {}, adds: {}, first_old_idx: nil, first_new_idx: nil }
+            if op.type == 'delete'
+                table.insert(current_hunk.deletes, op.text)
+                current_hunk.first_old_idx = current_hunk.first_old_idx or op.old_idx
+            elseif op.type == 'add'
+                table.insert(current_hunk.adds, op.text)
+                current_hunk.first_new_idx = current_hunk.first_new_idx or op.new_idx
+
+    if current_hunk
+        table.insert(hunks, current_hunk)
+
+    return hunks
+
+-- Main diff function: compare current lines vs updated lines
+-- Returns { ops: [...], hunks: [...], has_changes: bool }
+export default {
+    diff: (current_lines, updated_lines) ->
+        -- Fast path: identical
+        if #current_lines == #updated_lines
+            identical = true
+            for i = 1, #current_lines
+                if current_lines[i] ~= updated_lines[i]
+                    identical = false
+                    break
+            if identical
+                return { ops: {}, hunks: {}, has_changes: false }
+
+        dp = compute_lcs(current_lines, updated_lines)
+        ops = backtrack(dp, current_lines, updated_lines)
+        hunks = group_hunks(ops)
+
+        return { ops: ops, hunks: hunks, has_changes: #hunks > 0 }
+
+    -- Apply hunks to a set of lines, returning the updated lines
+    apply: (original_lines, hunks) ->
+        -- Rebuild from ops would be more correct, but for our use case
+        -- we already have the full updated_lines from the model
+        -- This function is here if we need to apply partial diffs
+        result = {}
+        for line in *original_lines
+            table.insert(result, line)
+
+        -- Apply hunks in reverse order to preserve indices
+        for i = #hunks, 1, -1
+            hunk = hunks[i]
+            if hunk.first_old_idx
+                -- Remove deleted lines
+                for j = 1, #hunk.deletes
+                    table.remove(result, hunk.first_old_idx)
+                -- Insert added lines at the same position
+                for j = #hunk.adds, 1, -1
+                    table.insert(result, hunk.first_old_idx, hunk.adds[j])
+            elseif hunk.first_new_idx
+                -- Pure additions (insertions)
+                insert_at = math.min(hunk.first_new_idx, #result + 1)
+                for j = #hunk.adds, 1, -1
+                    table.insert(result, insert_at, hunk.adds[j])
+
+        return result
+}
