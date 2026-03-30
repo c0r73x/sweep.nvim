@@ -180,12 +180,6 @@ export default class BufferState
             timestamp: state.timestamp
         }
 
-    clear_state: (bufnr) =>
-        if bufnr
-            @buffer_states[bufnr] = nil
-        else
-            @buffer_states = {}
-
     -- Apply the model's updated lines to the buffer using diff hunks
     -- This ensures only the changed lines are modified, matching the ghost text preview
     apply_update: (bufnr, context, updated_lines) =>

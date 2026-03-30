@@ -190,16 +190,6 @@ export default class EditTracker
 
         return chunks
 
-    -- Get original file content for a buffer (session baseline)
-    get_original_content: (bufnr) =>
-        return @original_contents[bufnr]
-
-    -- Clean up when buffer is closed/left
-    detach: (bufnr) =>
-        @attached_bufs[bufnr] = nil
-        @line_snapshots[bufnr] = nil
-        -- Keep original_contents and edit_history (useful across buffer switches)
-
     -- Full cleanup
     clear: () =>
         @attached_bufs = {}

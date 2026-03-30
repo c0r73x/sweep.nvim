@@ -27,7 +27,8 @@ export default class CompletionCache
         -- Check TTL
         now = vim.uv.hrtime() / 1e6
         if (now - entry.timestamp) > @ttl
-            @invalidate(key)
+            @cache[key] = nil
+            @size -= 1
             @total_misses += 1
             return nil
 
@@ -58,11 +59,6 @@ export default class CompletionCache
         }
         @size += 1
 
-    invalidate: (key) =>
-        if @cache[key]
-            @cache[key] = nil
-            @size -= 1
-
     clear: () =>
         @cache = {}
         @size = 0
@@ -77,7 +73,8 @@ export default class CompletionCache
                 oldest_key = key
 
         if oldest_key
-            @invalidate(oldest_key)
+            @cache[oldest_key] = nil
+            @size -= 1
 
     stats: () =>
         total_requests = @total_hits + @total_misses
