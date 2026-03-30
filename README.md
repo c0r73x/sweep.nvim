@@ -1,3 +1,6 @@
+> **Warning:** This plugin was developed with the assistance of
+> [Claude Code](https://claude.ai/claude-code). Use at your own risk.
+
 # sweep.nvim
 
 AI-powered code completions for Neovim using the
