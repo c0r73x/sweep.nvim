@@ -64,6 +64,7 @@ export default class Config
             completion_timeout: 5000    -- ms before giving up on a request
             auto_start: true            -- Auto-start proxy on VeryLazy
             proxy_script: "#{vim.fn.stdpath('config')}/scripts/sweep/sweep_proxy.py"
+            model_path: nil             -- Path to GGUF model (nil = proxy default)
         }
 
         context: {

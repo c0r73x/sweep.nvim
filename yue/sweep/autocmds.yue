@@ -187,10 +187,14 @@ very_lazy_callback = () ->
         (->
             proxy_script = ct.config.provider.proxy_script
             if vim.uv.fs_stat(proxy_script)
-                vim.fn.jobstart({'python3', proxy_script}, {
+                job_opts = {
                     detach: true
                     on_exit: proxy_exit_callback
-                })
+                }
+                model_path = ct.config.provider.model_path
+                if model_path
+                    job_opts.env = { MODEL_PATH: model_path }
+                vim.fn.jobstart({'python3', proxy_script}, job_opts)
                 -- Give proxy time to start, then warm up
                 vim.defer_fn((-> ct.client\health_check()), 2000)
         )
