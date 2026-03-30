@@ -48,21 +48,26 @@ just Python.
 - Neovim 0.10+
 - Python 3.10+ with `llama-cpp-python`, `fastapi`, `uvicorn`
 - The `sweep-next-edit` GGUF model (see [Model](#model) below)
+- [YueScript](https://github.com/IppClub/YueScript) — only if rebuilding from source
 
 ## Installation
 
 ### 1. Install with lazy.nvim
 
+Compiled Lua is included in the repo — no build step required:
+
 ```lua
 {
     "c0r73x/sweep.nvim",
-    build = "make",
     event = { "VeryLazy", "InsertEnter", "BufReadPost", "BufNewFile" },
     config = function()
         require("sweep").setup({})
     end,
 }
 ```
+
+If you want to rebuild from the [YueScript](https://github.com/IppClub/YueScript)
+sources, add `build = "make"`.
 
 ### 3. Set up the proxy
 
