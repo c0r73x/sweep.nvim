@@ -11,6 +11,25 @@ Runs a local Python proxy (`sweep_proxy.py`) that loads the model via
 `llama-cpp-python` and communicates with Neovim over a Unix domain socket
 (with HTTP fallback).
 
+## Why sweep.nvim
+
+cursortab.nvim routes requests through a compiled Go server over HTTP before
+they reach the model. sweep.nvim eliminates that middleman:
+
+```
+cursortab:  Neovim → HTTP → Go server → HTTP → llama.cpp server → model
+sweep.nvim: Neovim → Unix socket → Python proxy → model
+```
+
+The Unix domain socket skips all TCP stack overhead and HTTP parsing.
+Combined with `llama-cpp-python` running the model in-process (with flash
+attention and full GPU KV-cache offload enabled by default), round-trip
+latency is significantly lower — particularly noticeable on short FIM
+completions where the model is fast but transport overhead dominates.
+
+sweep.nvim also requires no extra language runtime to build: no Go toolchain,
+just Python.
+
 ## Features
 
 - **FIM completions** — inline ghost text at the cursor in insert mode
