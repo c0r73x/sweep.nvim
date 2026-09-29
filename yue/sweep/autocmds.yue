@@ -167,6 +167,15 @@ proxy_exit_callback = (job_id, code) ->
             (-> vim.notify("Sweep: Sweep proxy exited - model file not found or dependencies missing", vim.log.levels.WARN))
         )
 
+-- Poll every 500ms until the proxy socket exists, then health-check it
+wait_for_socket = (ct, tries) ->
+    if vim.uv.fs_stat(ct.client.sock_path)
+        ct.client\health_check()
+    elseif tries > 0
+        vim.defer_fn((-> wait_for_socket(ct, tries - 1)), 500)
+    else
+        ct.client\health_check()
+
 very_lazy_callback = () ->
     ct = _G.sweep
     return unless ct and ct.config.enabled
@@ -195,8 +204,9 @@ very_lazy_callback = () ->
                 if model_path
                     job_opts.env = { MODEL_PATH: model_path }
                 vim.fn.jobstart({'python3', proxy_script}, job_opts)
-                -- Give proxy time to start, then warm up
-                vim.defer_fn((-> ct.client\health_check()), 2000)
+                -- Warm up once the socket appears (the proxy binds it before
+                -- loading the model), rather than guessing a fixed delay
+                wait_for_socket(ct, 60)
         )
     )
 

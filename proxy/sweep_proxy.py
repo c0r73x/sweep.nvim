@@ -8,6 +8,7 @@ Serves both:
 
 import asyncio
 import difflib
+import fcntl
 import json
 import time
 import uuid
@@ -23,6 +24,21 @@ from llama_cpp import Llama
 
 proxy = None
 unix_server = None
+server = None
+lock_file = None
+exit_code = 0
+
+# The model loads in the background so the socket and port are bound
+# immediately; requests wait on this event instead of failing meanwhile.
+model_ready = None
+model_error = None
+
+# Exit after this many seconds with no connected clients and no requests
+# (0 disables). Each Neovim keeps its socket open, so the proxy only exits
+# once every editor is gone.
+IDLE_TIMEOUT = float(os.environ.get("SWEEP_IDLE_TIMEOUT", "900"))
+active_clients = set()
+last_activity = time.monotonic()
 
 # Special token constants for _strip_special_tokens
 THINK_START = "\u6014\u601D"
@@ -205,13 +221,83 @@ def get_socket_path():
     return f"/tmp/sweep-{os.getuid()}.sock"
 
 
+def get_lock_path():
+    """Return the single-instance lock path (next to the socket)."""
+    return os.path.splitext(get_socket_path())[0] + ".lock"
+
+
+def acquire_lock():
+    """Take an exclusive lock held for the lifetime of the process.
+
+    Stops a second proxy (e.g. from another Neovim started while the first
+    proxy is still loading the model) from loading a second copy of the
+    model and unlinking the first proxy's live socket.
+    """
+    global lock_file
+    lock_file = open(get_lock_path(), "w")
+    try:
+        fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        lock_file.close()
+        lock_file = None
+        return False
+    lock_file.write(str(os.getpid()))
+    lock_file.flush()
+    return True
+
+
+def touch():
+    global last_activity
+    last_activity = time.monotonic()
+
+
+def request_shutdown(code=0):
+    global exit_code
+    exit_code = code
+    if server:
+        server.should_exit = True
+
+
+async def ensure_model():
+    """Wait for the background model load; raise if it failed."""
+    await model_ready.wait()
+    if model_error:
+        raise RuntimeError(f"Model failed to load: {model_error}")
+
+
+async def load_model_task():
+    global model_error
+    try:
+        await asyncio.to_thread(proxy.load_model)
+    except Exception as e:
+        model_error = str(e)
+        print(f"ERROR: Failed to load model: {e}")
+        request_shutdown(1)
+    finally:
+        model_ready.set()
+
+
+async def idle_watcher():
+    interval = min(30, max(IDLE_TIMEOUT / 2, 1))
+    while True:
+        await asyncio.sleep(interval)
+        idle = time.monotonic() - last_activity
+        if not active_clients and idle > IDLE_TIMEOUT:
+            print(f"No clients for {int(idle)}s, shutting down")
+            request_shutdown(0)
+            return
+
+
 async def handle_unix_client(reader, writer):
     """Handle a single client connection on the Unix socket."""
+    active_clients.add(writer)
+    touch()
     try:
         while True:
             data = await reader.readline()
             if not data:
                 break
+            touch()
 
             try:
                 request = json.loads(data.decode("utf-8").strip())
@@ -224,11 +310,12 @@ async def handle_unix_client(reader, writer):
 
             if req_type == "health":
                 response = {
-                    "status": "ok",
+                    "status": "ok" if model_ready.is_set() else "loading",
                     "model": proxy.model_path if proxy else "not loaded",
                 }
             elif req_type == "completion":
                 try:
+                    await ensure_model()
                     mode = request.get("mode", "fim")
                     print(f"Completion request (mode={mode}): temp={request.get('temperature')}")
                     result = await asyncio.to_thread(
@@ -273,6 +360,8 @@ async def handle_unix_client(reader, writer):
     except Exception as e:
         print(f"Unix client error: {e}")
     finally:
+        active_clients.discard(writer)
+        touch()
         writer.close()
         try:
             await writer.wait_closed()
@@ -311,7 +400,7 @@ def cleanup_socket():
 
 @asynccontextmanager
 async def lifespan(app):
-    global proxy
+    global proxy, model_ready
     script_dir = os.path.dirname(os.path.abspath(__file__))
     default_model_path = os.path.join(
         script_dir, "models/sweep-next-edit-1.5b.q8_0.v2.gguf"
@@ -324,20 +413,30 @@ async def lifespan(app):
         sys.exit(1)
 
     proxy = SweepProxy(model_path)
-    try:
-        proxy.load_model()
-    except Exception as e:
-        print(f"ERROR: Failed to load model: {e}")
-        sys.exit(1)
+    model_ready = asyncio.Event()
 
-    # Start Unix socket server in the same event loop
+    # Bind the socket right away and load the model in the background, so
+    # clients connect (and queue requests) instead of timing out, and a
+    # second Neovim sees the proxy as running instead of spawning another.
     await start_unix_server()
+    loader = asyncio.create_task(load_model_task())
+    watcher = asyncio.create_task(idle_watcher()) if IDLE_TIMEOUT > 0 else None
 
     yield
 
+    for task in (watcher, loader):
+        if task:
+            task.cancel()
     if unix_server:
         unix_server.close()
-        await unix_server.wait_closed()
+        # wait_closed() waits for every client (Python 3.12+), so close
+        # them first or shutdown hangs while any Neovim is connected
+        for writer in list(active_clients):
+            writer.close()
+        try:
+            await asyncio.wait_for(unix_server.wait_closed(), 2)
+        except (asyncio.TimeoutError, Exception):
+            pass
     cleanup_socket()
 
 
@@ -347,6 +446,8 @@ app = FastAPI(lifespan=lifespan)
 @app.post("/v1/completions")
 async def completions(request: Request):
     try:
+        touch()
+        await ensure_model()
         req = await request.json()
         mode = req.get("mode", "fim")
         result = await asyncio.to_thread(
@@ -392,7 +493,7 @@ async def completions(request: Request):
 @app.get("/health")
 async def health():
     return {
-        "status": "ok",
+        "status": "ok" if model_ready and model_ready.is_set() else "loading",
         "model": proxy.model_path if proxy else "not loaded",
         "socket": get_socket_path(),
     }
@@ -400,21 +501,12 @@ async def health():
 
 if __name__ == "__main__":
     import atexit
-    import socket
 
-    # Check if another instance is already running
-    sock_path = get_socket_path()
-    try:
-        # Try to connect to existing socket
-        test_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        test_sock.settimeout(0.1)
-        result = test_sock.connect_ex(sock_path)
-        test_sock.close()
-        if result == 0:
-            print(f"Proxy already running at {sock_path}, exiting...")
-            sys.exit(0)
-    except Exception:
-        pass  # Socket doesn't exist or can't connect, continue
+    # Only one proxy per user: the lock is held until this process exits,
+    # so a proxy that is still loading the model counts as running too
+    if not acquire_lock():
+        print(f"Proxy already running (lock {get_lock_path()}), exiting...")
+        sys.exit(0)
 
     atexit.register(cleanup_socket)
 
@@ -424,4 +516,6 @@ if __name__ == "__main__":
 
     signal.signal(signal.SIGTERM, handle_sigterm)
 
-    uvicorn.run(app, host="127.0.0.1", port=5555)
+    server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=5555))
+    server.run()
+    sys.exit(exit_code)

@@ -1,5 +1,5 @@
 -- Sweep Proxy Client
--- Transport: Unix socket (preferred) → HTTP via vim.system (fallback)
+-- Transport: Unix socket (preferred) → HTTP via vim.net.request (fallback)
 -- Supports both FIM (inline completion) and edit (next-edit prediction) modes
 
 uv = vim.uv
@@ -13,6 +13,29 @@ FIM_STOP = {
     '<|fim_prefix|>', '<|fim_suffix|>', '<|fim_middle|>'
 }
 EDIT_STOP = {'<|file_sep|>', '</s>'}
+
+-- vim.net.request has no timeout, so cancel it from a timer.
+-- callback(err, body) runs on the main loop.
+http_request = (method, url, opts, timeout, callback) ->
+    done = false
+    timer = vim.uv.new_timer()
+
+    finish = (err, body) ->
+        return if done
+        done = true
+        timer\stop()
+        timer\close() unless timer\is_closing()
+        vim.schedule(-> callback(err, body))
+
+    req = vim.net.request(method, url, vim.tbl_extend('force', { retry: 0 }, opts),
+        (err, res) -> finish(err, res and res.body)
+    )
+
+    timer\start(timeout, 0, ->
+        return if done
+        req.close()
+        finish("timed out after #{timeout}ms")
+    )
 
 export default class SweepClient
     config: nil
@@ -169,32 +192,26 @@ export default class SweepClient
         -- Use request-specific timeout or config default
         timeout = request.timeout or @config.provider.completion_timeout or 5000
 
-        vim.system(
-            {'curl', '-s', '-X', 'POST', url,
-             '-H', 'Content-Type: application/json',
-             '-d', body,
-             '--connect-timeout', '2',
-             '--max-time', tostring(math.floor(timeout / 1000))
-            },
-            {},
-            vim.schedule_wrap((result) ->
-                if result.code ~= 0
-                    callback(nil, "HTTP failed (curl exit #{result.code})")
-                    return
+        http_request('POST', url, {
+            body: body
+            headers: { ['Content-Type']: 'application/json' }
+        }, timeout, (err, out) ->
+            if err
+                callback(nil, "HTTP failed: #{err}")
+                return
 
-                ok, response = pcall(vim.json.decode, result.stdout)
-                unless ok
-                    callback(nil, "HTTP JSON parse error")
-                    return
+            ok, response = pcall(vim.json.decode, out)
+            unless ok
+                callback(nil, "HTTP JSON parse error")
+                return
 
-                -- Handle new response format
-                if response.error
-                    callback(nil, response.error)
-                    return
+            -- Handle new response format
+            if response.error
+                callback(nil, response.error)
+                return
 
-                -- Return response as-is for unified handling
-                callback(response, nil)
-            )
+            -- Return response as-is for unified handling
+            callback(response, nil)
         )
 
     -- ---------------------------------------------------------------
@@ -240,16 +257,12 @@ export default class SweepClient
     -- ---------------------------------------------------------------
     health_check: () =>
         if @transport == 'http' or not uv.fs_stat(@sock_path)
-            vim.system(
-                {'curl', '-s', "#{@config.provider.url}/health", '--connect-timeout', '2'},
-                {},
-                vim.schedule_wrap((result) ->
-                    if result.code == 0
-                        @log("Sweep proxy is healthy (HTTP)", vim.log.levels.INFO)
-                        @transport = 'http'
-                    else
-                        @log("Sweep proxy not responding", vim.log.levels.WARN)
-                )
+            http_request('GET', "#{@config.provider.url}/health", {}, 2000, (err) ->
+                if err
+                    @log("Sweep proxy not responding", vim.log.levels.WARN)
+                else
+                    @log("Sweep proxy is healthy (HTTP)", vim.log.levels.INFO)
+                    @transport = 'http'
             )
         else
             @send({ type: 'health' }, (response, err) ->
@@ -349,7 +362,8 @@ export default class SweepClient
                     @log("Got #{#updated_lines} lines from model (#{mode})")
                     callback(updated_lines, nil)
                 else
-                    @log("Empty edit response from model", vim.log.levels.WARN)
+                    -- Normal: the model often has no edit to suggest
+                    @log("Empty edit response from model")
                     callback(nil, nil)
         )
 
