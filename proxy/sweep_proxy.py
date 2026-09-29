@@ -246,6 +246,30 @@ def acquire_lock():
     return True
 
 
+def detach_output():
+    """Send stdout/stderr to a log file.
+
+    The proxy is spawned by whichever Neovim starts first but serves every
+    instance and outlives its parent. Its stdout/stderr are pipes to that
+    parent; once it exits, any print() (ours or uvicorn's) raises
+    BrokenPipeError, which the request handlers then return as the error for
+    every completion. Writing to a file instead makes output independent of
+    the parent's lifetime.
+    """
+    state = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
+    log_path = os.environ.get("SWEEP_LOG", os.path.join(state, "sweep-proxy.log"))
+    try:
+        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+        fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    except OSError:
+        fd = os.open(os.devnull, os.O_WRONLY)
+    os.dup2(fd, 1)
+    os.dup2(fd, 2)
+    os.close(fd)
+    sys.stdout = os.fdopen(1, "w", buffering=1)
+    sys.stderr = os.fdopen(2, "w", buffering=1)
+
+
 def touch():
     global last_activity
     last_activity = time.monotonic()
@@ -508,6 +532,7 @@ if __name__ == "__main__":
         print(f"Proxy already running (lock {get_lock_path()}), exiting...")
         sys.exit(0)
 
+    detach_output()
     atexit.register(cleanup_socket)
 
     def handle_sigterm(signum, frame):
