@@ -200,9 +200,10 @@ very_lazy_callback = () ->
                     detach: true
                     on_exit: proxy_exit_callback
                 }
+                env = vim.deepcopy(ct.config.provider.env or {})
                 model_path = ct.config.provider.model_path
-                if model_path
-                    job_opts.env = { MODEL_PATH: model_path }
+                env.MODEL_PATH = model_path if model_path
+                job_opts.env = env if next(env)
                 vim.fn.jobstart({'python3', proxy_script}, job_opts)
                 -- Warm up once the socket appears (the proxy binds it before
                 -- loading the model), rather than guessing a fixed delay

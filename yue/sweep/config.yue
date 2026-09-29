@@ -65,6 +65,7 @@ export default class Config
             auto_start: true            -- Auto-start proxy on VeryLazy
             proxy_script: "#{vim.fn.stdpath('config')}/scripts/sweep/sweep_proxy.py"
             model_path: nil             -- Path to GGUF model (nil = proxy default)
+            env: nil                    -- Extra environment for the proxy process
         }
 
         context: {

@@ -196,6 +196,9 @@ require("sweep").setup({
         auto_start         = true,
         proxy_script       = vim.fn.stdpath("data") .. "/lazy/sweep.nvim/proxy/sweep_proxy.py",
         model_path         = nil,      -- Path to GGUF model (nil = proxy default)
+        env                = nil,      -- Extra environment for the proxy, e.g.
+                                       -- { VK_DRIVER_FILES = "..." } to pick a
+                                       -- Vulkan driver
     },
 
     context = {
