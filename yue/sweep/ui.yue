@@ -66,6 +66,7 @@ export default class GhostText
 
         @mode = 'fim'
         @current_completion = completion
+        @current_context = context
         @current_bufnr = bufnr
         @current_line = line_num
         @current_col = col
@@ -133,65 +134,34 @@ export default class GhostText
             @render_addition(hunk, window_start, bufnr)
 
     render_modification: (hunk, window_start, bufnr) =>
-        total_lines = api.nvim_buf_line_count(bufnr)
-        if hunk.first_old_idx
-            for i = 0, #hunk.deletes - 1
-                -- Convert 1-indexed array position to 0-indexed buffer line
-                -- window_start is 1-indexed buffer line, subtract 1 for 0-indexed
-                -- hunk.first_old_idx is 1-indexed position in window array, subtract 1
-                -- i is 0-indexed offset from first deletion
-                buf_line = (window_start - 1) + (hunk.first_old_idx - 1) + i
-                if buf_line >= 0 and buf_line < total_lines
-                    line_text = api.nvim_buf_get_lines(bufnr, buf_line, buf_line + 1, false)[1] or ''
-                    id = api.nvim_buf_set_extmark(bufnr, @ns_id, buf_line, 0, {
-                        end_row: buf_line
-                        end_col: #line_text
-                        hl_group: 'SweepDeletion'
-                        hl_mode: 'combine'
-                    })
-                    table.insert(@extmark_ids, id)
-
-        if #hunk.adds > 0
-            -- Place virtual lines after the last deleted line (or at first_old_idx if no deletes)
-            -- For virt_lines, anchor is the line AFTER which to insert
-            anchor = (window_start - 1) + (hunk.first_old_idx or 1) - 1 + #hunk.deletes - 1
-            anchor = math.max(0, math.min(anchor, total_lines - 1))
-
-            virt_lines = {}
-            for _, add_line in ipairs(hunk.adds)
-                -- Empty strings don't render in virt_lines, use a space instead
-                display_line = #add_line > 0 and add_line or ' '
-                table.insert(virt_lines, {{display_line, 'SweepAddition'}})
-
-            id = api.nvim_buf_set_extmark(bufnr, @ns_id, anchor, 0, {
-                virt_lines: virt_lines
-                virt_lines_above: false
-                hl_mode: 'combine'
-            })
-            table.insert(@extmark_ids, id)
+        @render_deletion(hunk, window_start, bufnr)
+        @render_addition(hunk, window_start, bufnr)
 
     render_deletion: (hunk, window_start, bufnr) =>
         total_lines = api.nvim_buf_line_count(bufnr)
-        if hunk.first_old_idx
-            for i = 0, #hunk.deletes - 1
-                -- Convert 1-indexed array position to 0-indexed buffer line
-                buf_line = (window_start - 1) + (hunk.first_old_idx - 1) + i
-                if buf_line >= 0 and buf_line < total_lines
-                    line_text = api.nvim_buf_get_lines(bufnr, buf_line, buf_line + 1, false)[1] or ''
-                    id = api.nvim_buf_set_extmark(bufnr, @ns_id, buf_line, 0, {
-                        end_row: buf_line
-                        end_col: #line_text
-                        hl_group: 'SweepDeletion'
-                        hl_mode: 'combine'
-                    })
-                    table.insert(@extmark_ids, id)
+        for i = 0, #hunk.deletes - 1
+            -- Convert 1-indexed array position to 0-indexed buffer line:
+            -- window_start is the 1-indexed buffer line of window line 1,
+            -- hunk.old_start the 1-indexed window line of the first deletion
+            buf_line = (window_start - 1) + (hunk.old_start - 1) + i
+            if buf_line >= 0 and buf_line < total_lines
+                line_text = api.nvim_buf_get_lines(bufnr, buf_line, buf_line + 1, false)[1] or ''
+                id = api.nvim_buf_set_extmark(bufnr, @ns_id, buf_line, 0, {
+                    end_row: buf_line
+                    end_col: #line_text
+                    hl_group: 'SweepDeletion'
+                    hl_mode: 'combine'
+                })
+                table.insert(@extmark_ids, id)
 
+    -- Show the adds as virtual lines where they would end up: below the
+    -- last deleted line, or for a pure insertion below the old line before
+    -- old_start (above the first line when inserting at the buffer top)
     render_addition: (hunk, window_start, bufnr) =>
         total_lines = api.nvim_buf_line_count(bufnr)
-        -- hunk.first_new_idx is 1-indexed position in updated_lines array
-        -- For pure additions, place virtual lines after the line at new_idx - 1
-        -- Anchor is the line AFTER which to insert virtual lines
-        anchor = (window_start - 1) + (hunk.first_new_idx or 1) - 1 - 1
+        -- 0-indexed buffer row of the line the adds follow
+        anchor = (window_start - 1) + (hunk.old_start - 1) + #hunk.deletes - 1
+        above = anchor < 0
         anchor = math.max(0, math.min(anchor, total_lines - 1))
 
         virt_lines = {}
@@ -202,7 +172,7 @@ export default class GhostText
 
         id = api.nvim_buf_set_extmark(bufnr, @ns_id, anchor, 0, {
             virt_lines: virt_lines
-            virt_lines_above: false
+            virt_lines_above: above
             hl_mode: 'combine'
         })
         table.insert(@extmark_ids, id)
@@ -211,6 +181,7 @@ export default class GhostText
     -- Common
     -- ---------------------------------------------------------------
     hide: () =>
+        return unless @visible or #@extmark_ids > 0 or @mode
         if @current_bufnr and api.nvim_buf_is_valid(@current_bufnr)
             for _, id in ipairs(@extmark_ids)
                 pcall(api.nvim_buf_del_extmark, @current_bufnr, @ns_id, id)
@@ -232,7 +203,7 @@ export default class GhostText
     get_completion_data: () =>
         return nil unless @visible
         if @mode == 'fim'
-            return { mode: 'fim', completion: @current_completion }
+            return { mode: 'fim', completion: @current_completion, context: @current_context }
         elseif @mode == 'edit'
             return { mode: 'edit', updated_lines: @current_updated_lines, context: @current_context }
         return nil
@@ -248,7 +219,12 @@ export default class GhostText
     setup_blink_listeners: () =>
         return unless @config.blink.enabled
 
+        -- Own group, cleared on re-setup so :SweepReload doesn't stack
+        -- listeners bound to stale instances
+        group = api.nvim_create_augroup('sweep_blink', { clear: true })
+
         api.nvim_create_autocmd('User', {
+            group: group
             pattern: 'BlinkCmpMenuOpen'
             callback: ->
                 @blink_menu_visible = true
@@ -256,12 +232,14 @@ export default class GhostText
         })
 
         api.nvim_create_autocmd('User', {
+            group: group
             pattern: 'BlinkCmpMenuClose'
             callback: ->
                 @blink_menu_visible = false
         })
 
         api.nvim_create_autocmd('User', {
+            group: group
             pattern: 'BlinkCmpAccept'
             callback: ->
                 @blink_menu_visible = false

@@ -48,6 +48,9 @@ class Sweep
         GhostText = @GhostText
         EditTracker = @EditTracker
 
+        -- Calling setup() again replaces the modules; stop the old ones
+        @shutdown()
+
         config_instance = Config!
         @config = config_instance\setup(opts)
         @buffer_state = BufferState(@config)
@@ -69,16 +72,49 @@ class Sweep
         if log_level == 'debug' or (level and level >= vim.log.levels.WARN)
             pcall(vim.notify, "Sweep: #{msg}", level or vim.log.levels.INFO)
 
+    -- Is the buffer still exactly as it was when context was taken?
+    -- FIM text is tied to the cursor position, edit predictions to the
+    -- window (and to the cursor line when they hide on cursor move).
+    is_context_current: (context, mode) =>
+        return false unless context
+        bufnr = context.bufnr
+        return false unless bufnr and api.nvim_buf_is_valid(bufnr)
+        return false unless bufnr == api.nvim_get_current_buf()
+        return false unless context.changedtick and
+            api.nvim_buf_get_changedtick(bufnr) == context.changedtick
+        pos = api.nvim_win_get_cursor(0)
+        if mode == 'fim'
+            return false unless pos[1] == context.line_num and
+                pos[2] == context.cursor_col
+        elseif @config.behavior.hide_on_cursor_move
+            return false unless pos[1] == context.line_num
+        true
+
+    -- Cache keys are built from the exact text the prompt is built from,
+    -- so a hit can only return a result for identical input
+    cache_key: (mode, context) =>
+        cur = table.concat(context.current_lines or {}, '\n')
+        if mode == 'fim'
+            "fim\0#{context.cursor_offset}\0#{context.cursor_col}\0#{cur}"
+        else
+            orig = table.concat(context.original_lines or {}, '\n')
+            "edit\0#{context.filepath}\0#{orig}\0#{cur}"
+
     -- Main completion trigger
     trigger_completion: (bufnr) =>
         return unless @config.enabled
+        bufnr = bufnr or api.nvim_get_current_buf()
         unless @buffer_state\is_valid_buffer(bufnr)
             @log("Buffer #{bufnr} not valid, skipping")
             return
+        -- Buffer state is read from the current window
+        return unless bufnr == api.nvim_get_current_buf()
 
         if @processing
-            -- Mark that new input arrived; when current request
-            -- completes it will be discarded and a fresh one sent.
+            -- Mark that new input arrived; the current request is aborted
+            -- (proxy-side) and a fresh one sent once it has finished.
+            unless @_pending_retrigger
+                @client\cancel()
             @_pending_retrigger = bufnr
             return
 
@@ -88,6 +124,8 @@ class Sweep
             @log("Blink menu visible, skipping request")
             return
 
+        -- Read the buffer now (after debounce), not on every keystroke
+        @buffer_state\update_state(bufnr)
         context = @buffer_state\get_context(bufnr)
         unless context
             @log("No context for buffer #{bufnr}")
@@ -104,14 +142,13 @@ class Sweep
         else
             configured_mode
 
-        -- Cache key depends on mode
-        cache_key = if mode == 'fim'
-            "#{context.line_content}_#{context.cursor_col}"
-        else
-            orig = table.concat(context.original_lines or {}, '\n')
-            cur = table.concat(context.current_lines or {}, '\n')
-            "#{orig}\0#{cur}"
+        @request(mode, context)
 
+    -- Send a request for context; the result is shown only if the buffer
+    -- (and cursor) still match it when it arrives
+    request: (mode, context) =>
+        bufnr = context.bufnr
+        cache_key = @cache_key(mode, context)
         cached = @cache\get(cache_key)
         if cached
             @log("Cache hit")
@@ -119,10 +156,14 @@ class Sweep
             return
 
         @_pending_retrigger = nil
+        @_request_seq = (@_request_seq or 0) + 1
+        seq = @_request_seq
         @set_processing(true)
         @log("Requesting #{mode} completion...")
         @client\request_completion(mode, context, @tracker, (result, err) ->
             vim.schedule(->
+                -- Cleared (or replaced) while in flight
+                return unless seq == @_request_seq
                 @set_processing(false)
 
                 -- If new input arrived while we were processing,
@@ -161,12 +202,14 @@ class Sweep
                     @log("Got #{#result} lines")
 
                 @cache\set(cache_key, result)
-                fresh_context = @buffer_state\get_context(bufnr)
-                unless fresh_context
-                    @log("Context gone, skipping show")
+
+                -- The result was computed for this context; drop it if the
+                -- buffer or cursor moved on in the meantime
+                unless @is_context_current(context, mode)
+                    @log("Buffer changed since request, discarding")
                     return
 
-                @show_result(mode, result, fresh_context)
+                @show_result(mode, result, context)
             )
         )
 
@@ -176,46 +219,48 @@ class Sweep
         else
             @ghost_text\show_edit(result, context)
 
-    -- Accept current completion
-    accept: () =>
+    -- Is there a visible completion that still applies to the buffer?
+    can_accept: () =>
         data = @ghost_text\get_completion_data()
-        return '<Tab>' unless data
+        return false unless data
+        if @is_context_current(data.context, data.mode)
+            return true
+        -- Stale: hide it so it can't be accepted later either
+        @ghost_text\hide()
+        false
+
+    -- Accept current completion
+    -- Returns '' when accepted, '<Tab>' (pass-through) otherwise
+    accept: () =>
+        return '<Tab>' unless @can_accept()
+        data = @ghost_text\get_completion_data()
 
         @ghost_text\hide()
 
         if data.mode == 'fim'
-            @insert_fim_completion(data.completion)
+            @insert_fim_completion(data.completion, data.context)
         elseif data.mode == 'edit'
             @buffer_state\apply_update(data.context.bufnr, data.context, data.updated_lines)
 
         @cache\clear()
         return ''
 
-    -- Insert FIM completion text at cursor
-    insert_fim_completion: (completion) =>
-        bufnr = vim.api.nvim_get_current_buf()
-        pos = vim.api.nvim_win_get_cursor(0)
-        line_num = pos[1]
-        col = pos[2]
+    -- Insert FIM completion text at the position it was generated for.
+    -- set_text only touches the inserted range, so marks, extmarks and
+    -- diagnostics on the rest of the line survive.
+    insert_fim_completion: (completion, context) =>
+        bufnr = context and context.bufnr or api.nvim_get_current_buf()
+        pos = api.nvim_win_get_cursor(0)
+        line_num = context and context.line_num or pos[1]
+        col = context and context.cursor_col or pos[2]
 
-        line = vim.api.nvim_buf_get_lines(bufnr, line_num - 1, line_num, false)[1] or ''
-        lines = vim.split(completion, '\n')
+        lines = vim.split(completion, '\n', { plain: true })
+        api.nvim_buf_set_text(bufnr, line_num - 1, col, line_num - 1, col, lines)
 
         if #lines == 1
-            before = string.sub(line, 1, col)
-            after = string.sub(line, col + 1)
-            vim.api.nvim_buf_set_lines(bufnr, line_num - 1, line_num, false, {before .. completion .. after})
-            vim.api.nvim_win_set_cursor(0, {line_num, col + #completion})
+            api.nvim_win_set_cursor(0, {line_num, col + #completion})
         else
-            before = string.sub(line, 1, col)
-            after = string.sub(line, col + 1)
-            new_lines = {before .. lines[1]}
-            for i = 2, #lines - 1
-                table.insert(new_lines, lines[i])
-            table.insert(new_lines, lines[#lines] .. after)
-            vim.api.nvim_buf_set_lines(bufnr, line_num - 1, line_num, false, new_lines)
-            new_line_num = line_num + #lines - 1
-            vim.api.nvim_win_set_cursor(0, {new_line_num, #lines[#lines]})
+            api.nvim_win_set_cursor(0, {line_num + #lines - 1, #lines[#lines]})
 
     -- Reject/hide completion
     reject: () =>
@@ -225,7 +270,25 @@ class Sweep
     clear: () =>
         @ghost_text\hide()
         @cache\clear()
+        -- Ignore the response of any request still in flight
+        @_request_seq = (@_request_seq or 0) + 1
+        @_pending_retrigger = nil
         @set_processing(false)
+
+    -- Stop timers, callbacks and the connection of a previous setup()
+    shutdown: () =>
+        timer = @_debounce_timer
+        @_debounce_timer = nil
+        @_timer_token = (@_timer_token or 0) + 1
+        if timer and not timer\is_closing()
+            timer\stop()
+            timer\close()
+        @ghost_text\hide() if @ghost_text
+        @tracker\shutdown() if @tracker
+        @client\disconnect() if @client
+        @_request_seq = (@_request_seq or 0) + 1
+        @_pending_retrigger = nil
+        @processing = false
 
     setup_autocmds: () =>
         autocmds = require('sweep.autocmds')
@@ -274,7 +337,7 @@ class Sweep
     cmd_reload: () =>
         vim.notify("Sweep: Reloading...", vim.log.levels.INFO)
         saved_opts = @_setup_opts or {}
-        @client\disconnect() if @client
+        @shutdown()
         for mod in *{'sweep', 'sweep.sweep', 'sweep.config', 'sweep.buffer', 'sweep.cache', 'sweep.client', 'sweep.ui', 'sweep.keymaps', 'sweep.autocmds', 'sweep.diff', 'sweep.tracker'}
             package.loaded[mod] = nil
 
@@ -309,23 +372,7 @@ class Sweep
         context = @buffer_state\get_context(bufnr)
         return unless context
 
-        @set_processing(true)
-        @log("Requesting edit prediction...")
-        @client\request_completion('edit', context, @tracker, (result, err) ->
-            vim.schedule(->
-                @set_processing(false)
-                if err
-                    @log("Edit error: #{err}", vim.log.levels.WARN)
-                    return
-                unless result and type(result) == 'table' and #result > 0
-                    @log("Empty edit response")
-                    return
-                @log("Got #{#result} lines for edit prediction")
-                fresh_context = @buffer_state\get_context(bufnr)
-                if fresh_context
-                    @ghost_text\show_edit(result, fresh_context)
-            )
-        )
+        @request('edit', context)
 
 -- Create global instance
 if not sweep

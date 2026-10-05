@@ -15,6 +15,7 @@ import uuid
 import os
 import signal
 import sys
+import threading
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Request
@@ -40,6 +41,10 @@ IDLE_TIMEOUT = float(os.environ.get("SWEEP_IDLE_TIMEOUT", "900"))
 active_clients = set()
 last_activity = time.monotonic()
 
+# instance_id -> cancel Event of that Neovim's current generation. A new
+# request (or an explicit cancel) from the same instance aborts the old one.
+active_generations = {}
+
 # Special token constants for _strip_special_tokens
 THINK_START = "\u6014\u601D"
 THINK_END = "\u601D\u6029"
@@ -48,12 +53,21 @@ BACKTICKS = "```"
 CLOSE_S_TAG = "</s>"
 
 
+class Cancelled(Exception):
+    """Generation aborted: superseded, cancelled or client gone."""
+
+
 class SweepProxy:
     def __init__(self, model_path, max_tokens=512, temperature=0.0):
         self.model_path = model_path
         self.max_tokens = max_tokens
         self.temperature = temperature
         self.llm = None
+        # Llama is not thread-safe; requests from several Neovims (socket
+        # and HTTP) run in worker threads, so only one may use it at a time.
+        # A threading lock (not asyncio) is held by the worker itself, so a
+        # cancelled asyncio task can't release it while the model still runs.
+        self.lock = threading.Lock()
 
     def load_model(self):
         print(f"Loading model: {self.model_path}")
@@ -69,8 +83,12 @@ class SweepProxy:
         print("Model loaded successfully")
 
     def complete(self, prompt, max_tokens=None, temperature=None, stop=None,
-                 top_p=None, top_k=None, repeat_penalty=None):
-        """Run completion and return extracted text + metadata."""
+                 top_p=None, top_k=None, repeat_penalty=None, cancel=None):
+        """Run completion and return extracted text + metadata.
+
+        Streams tokens so a set `cancel` event aborts the generation within
+        a token; raises Cancelled then.
+        """
         max_tokens = max_tokens or self.max_tokens
         # Ensure temperature is never exactly 0.0 - llama-cpp treats it as "default"
         if temperature is None:
@@ -91,18 +109,29 @@ class SweepProxy:
         if repeat_penalty is not None and repeat_penalty != 1.0:
             kwargs["repeat_penalty"] = repeat_penalty
 
-        result = self.llm(prompt, **kwargs)
-
-        text = ""
-        finish_reason = "stop"
-        if result.get("choices"):
-            text = result["choices"][0].get("text", "")
-            finish_reason = result["choices"][0].get("finish_reason", "stop")
+        with self.lock:
+            if cancel is not None and cancel.is_set():
+                raise Cancelled()
+            parts = []
+            finish_reason = "stop"
+            n_chunks = 0
+            stream = self.llm(prompt, stream=True, **kwargs)
+            try:
+                for chunk in stream:
+                    if cancel is not None and cancel.is_set():
+                        raise Cancelled()
+                    n_chunks += 1
+                    choices = chunk.get("choices") or [{}]
+                    parts.append(choices[0].get("text") or "")
+                    finish_reason = choices[0].get("finish_reason") or finish_reason
+            finally:
+                stream.close()
 
         return {
-            "text": text,
+            "text": "".join(parts),
             "finish_reason": finish_reason,
-            "usage": result.get("usage", {}),
+            # Streaming reports no usage; chunks are roughly tokens
+            "usage": {"completion_tokens": n_chunks},
         }
 
     def _strip_special_tokens(self, text):
@@ -117,7 +146,9 @@ class SweepProxy:
             text = text.replace(tok, "")
         text = text.replace(BACKTICKS, "")
         text = text.replace(CLOSE_S_TAG, "")
-        return text.strip()
+        # No strip(): leading whitespace is meaningful (FIM text continues
+        # the line at the cursor, edit lines keep their indentation)
+        return text
 
     def post_process_fim(self, text, finish_reason, suffix_lines=None, max_lines=21):
         """Post-process FIM completion response."""
@@ -138,7 +169,10 @@ class SweepProxy:
                     lines = lines[:i]
                     break
             text = "\n".join(lines)
-        return text.strip()
+        # Text is inserted verbatim at the cursor: a leading space or
+        # newline + indent is part of the completion. Only drop trailing
+        # whitespace (the model ends with a newline before the suffix).
+        return text.rstrip()
 
     def post_process_edit(self, text, finish_reason, current_lines=None, cursor_offset=0, proximity=8):
         """Post-process edit completion response."""
@@ -148,8 +182,18 @@ class SweepProxy:
         if finish_reason == "length" and "\n" in text:
             lines = text.rstrip("\n").rsplit("\n", 1)
             text = lines[0] if len(lines) > 1 else text
-        text = text.strip()
-        updated_lines = text.split("\n") if text else []
+        # The prompt ends with "<|file_sep|>updated/<path>" so the output
+        # starts with that line's newline, and usually ends with a newline
+        # before the next separator. Drop exactly those; blank lines and
+        # indentation beyond them belong to the window content.
+        if text.startswith("\r\n"):
+            text = text[2:]
+        elif text.startswith("\n"):
+            text = text[1:]
+        if text.endswith("\n"):
+            text = text[:-1]
+        text = text.rstrip("\r")
+        updated_lines = text.split("\n") if text.strip() else []
         if not current_lines:
             return updated_lines
         hunks = self._compute_diff(current_lines, updated_lines)
@@ -312,10 +356,125 @@ async def idle_watcher():
             return
 
 
+async def run_completion(req, cancel):
+    """Run one completion request (socket or HTTP) and post-process it.
+
+    `cancel` is a threading.Event; it is registered as the instance's
+    current generation, aborting the instance's previous one. Returns
+    (response_fields, raw_result); raises Cancelled when aborted.
+    """
+    await ensure_model()
+    instance_id = req.get("instance_id")
+    if instance_id:
+        previous = active_generations.get(instance_id)
+        if previous is not None:
+            previous.set()
+        active_generations[instance_id] = cancel
+    try:
+        mode = req.get("mode", "fim")
+        print(f"Completion request (mode={mode}): temp={req.get('temperature')}")
+        result = await asyncio.to_thread(
+            proxy.complete,
+            prompt=req.get("prompt", ""),
+            max_tokens=req.get("max_tokens"),
+            temperature=req.get("temperature"),
+            stop=req.get("stop"),
+            top_p=req.get("top_p"),
+            top_k=req.get("top_k"),
+            repeat_penalty=req.get("repeat_penalty"),
+            cancel=cancel,
+        )
+    except asyncio.CancelledError:
+        # The worker thread keeps running (holding the model lock) until
+        # it sees the event
+        cancel.set()
+        raise
+    finally:
+        if instance_id and active_generations.get(instance_id) is cancel:
+            del active_generations[instance_id]
+
+    # Apply mode-aware post-processing
+    text = result.get("text", "")
+    finish_reason = result.get("finish_reason", "stop")
+    if mode == "fim":
+        suffix_lines = req.get("suffix_lines")
+        max_lines = req.get("max_lines", 21)
+        text = proxy.post_process_fim(text, finish_reason, suffix_lines, max_lines)
+        return {"text": text, "finish_reason": finish_reason}, result
+    if mode == "edit":
+        current_lines = req.get("current_lines")
+        cursor_offset = req.get("cursor_offset", 0)
+        proximity = req.get("proximity", 8)
+        print(f"Edit mode: current_lines={len(current_lines) if current_lines else 0}, cursor_offset={cursor_offset}")
+        updated_lines = proxy.post_process_edit(text, finish_reason, current_lines, cursor_offset, proximity)
+        print(f"Edit result: {len(updated_lines)} lines")
+        return {"updated_lines": updated_lines, "finish_reason": finish_reason}, result
+    return result, result
+
+
+def cancel_instance(instance_id):
+    """Abort the running/queued generation of an instance, if any."""
+    event = active_generations.get(instance_id) if instance_id else None
+    if event is None:
+        return False
+    event.set()
+    return True
+
+
+async def handle_unix_request(request, cancel):
+    """Build the response for one socket request."""
+    req_type = request.get("type", "completion")
+    if req_type == "health":
+        return {
+            "status": "ok" if model_ready.is_set() else "loading",
+            "model": proxy.model_path if proxy else "not loaded",
+        }
+    if req_type == "cancel":
+        found = cancel_instance(request.get("instance_id"))
+        return {"status": "cancelled" if found else "idle"}
+    if req_type == "completion":
+        try:
+            response, _ = await run_completion(request, cancel)
+            return response
+        except Cancelled:
+            return {"error": "cancelled"}
+        except Exception as e:
+            return {"error": str(e)}
+    return {"error": f"Unknown type: {req_type}"}
+
+
 async def handle_unix_client(reader, writer):
-    """Handle a single client connection on the Unix socket."""
+    """Handle a single client connection on the Unix socket.
+
+    Requests are handled concurrently (a cancel or health check must not
+    wait behind a generation); replies echo the request "id" so the client
+    can pair them. When the client disconnects, its generations are aborted.
+    """
     active_clients.add(writer)
     touch()
+    write_lock = asyncio.Lock()
+    tasks = set()
+    cancels = set()
+
+    async def reply(response):
+        async with write_lock:
+            writer.write((json.dumps(response) + "\n").encode())
+            await writer.drain()
+
+    async def serve(request):
+        cancel = threading.Event()
+        cancels.add(cancel)
+        try:
+            response = await handle_unix_request(request, cancel)
+        finally:
+            cancels.discard(cancel)
+        if "id" in request:
+            response = {**response, "id": request["id"]}
+        try:
+            await reply(response)
+        except (ConnectionError, RuntimeError):
+            pass
+
     try:
         while True:
             data = await reader.readline()
@@ -325,58 +484,15 @@ async def handle_unix_client(reader, writer):
 
             try:
                 request = json.loads(data.decode("utf-8").strip())
-            except json.JSONDecodeError:
-                writer.write((json.dumps({"error": "Invalid JSON"}) + "\n").encode())
-                await writer.drain()
+                if not isinstance(request, dict):
+                    raise ValueError("not an object")
+            except (ValueError, UnicodeDecodeError):
+                await reply({"error": "Invalid JSON"})
                 continue
 
-            req_type = request.get("type", "completion")
-
-            if req_type == "health":
-                response = {
-                    "status": "ok" if model_ready.is_set() else "loading",
-                    "model": proxy.model_path if proxy else "not loaded",
-                }
-            elif req_type == "completion":
-                try:
-                    await ensure_model()
-                    mode = request.get("mode", "fim")
-                    print(f"Completion request (mode={mode}): temp={request.get('temperature')}")
-                    result = await asyncio.to_thread(
-                        proxy.complete,
-                        prompt=request.get("prompt", ""),
-                        max_tokens=request.get("max_tokens"),
-                        temperature=request.get("temperature"),
-                        stop=request.get("stop"),
-                        top_p=request.get("top_p"),
-                        top_k=request.get("top_k"),
-                        repeat_penalty=request.get("repeat_penalty"),
-                    )
-                    # Apply mode-aware post-processing
-                    text = result.get("text", "")
-                    finish_reason = result.get("finish_reason", "stop")
-                    if mode == "fim":
-                        suffix_lines = request.get("suffix_lines")
-                        max_lines = request.get("max_lines", 21)
-                        text = proxy.post_process_fim(text, finish_reason, suffix_lines, max_lines)
-                        response = {"text": text, "finish_reason": finish_reason}
-                    elif mode == "edit":
-                        current_lines = request.get("current_lines")
-                        cursor_offset = request.get("cursor_offset", 0)
-                        proximity = request.get("proximity", 8)
-                        print(f"Edit mode: current_lines={len(current_lines) if current_lines else 0}, cursor_offset={cursor_offset}")
-                        updated_lines = proxy.post_process_edit(text, finish_reason, current_lines, cursor_offset, proximity)
-                        print(f"Edit result: {len(updated_lines)} lines")
-                        response = {"updated_lines": updated_lines, "finish_reason": finish_reason}
-                    else:
-                        response = result
-                except Exception as e:
-                    response = {"error": str(e)}
-            else:
-                response = {"error": f"Unknown type: {req_type}"}
-
-            writer.write((json.dumps(response) + "\n").encode())
-            await writer.drain()
+            task = asyncio.create_task(serve(request))
+            tasks.add(task)
+            task.add_done_callback(tasks.discard)
     except asyncio.CancelledError:
         pass
     except ConnectionResetError:
@@ -384,6 +500,11 @@ async def handle_unix_client(reader, writer):
     except Exception as e:
         print(f"Unix client error: {e}")
     finally:
+        # Nobody is left to read the results
+        for event in list(cancels):
+            event.set()
+        for task in list(tasks):
+            task.cancel()
         active_clients.discard(writer)
         touch()
         writer.close()
@@ -404,8 +525,13 @@ async def start_unix_server():
     except FileNotFoundError:
         pass
 
-    unix_server = await asyncio.start_unix_server(handle_unix_client, path=sock_path)
-    os.chmod(sock_path, 0o600)
+    # Create the socket owner-only from the start (a chmod after bind
+    # leaves a window where other users could connect)
+    old_umask = os.umask(0o077)
+    try:
+        unix_server = await asyncio.start_unix_server(handle_unix_client, path=sock_path)
+    finally:
+        os.umask(old_umask)
     print(f"Unix socket listening on {sock_path}")
 
 
@@ -467,40 +593,23 @@ async def lifespan(app):
 app = FastAPI(lifespan=lifespan)
 
 
+async def watch_disconnect(request, cancel):
+    """Abort the generation once the HTTP client goes away."""
+    while not cancel.is_set():
+        if await request.is_disconnected():
+            cancel.set()
+            return
+        await asyncio.sleep(0.1)
+
+
 @app.post("/v1/completions")
 async def completions(request: Request):
+    cancel = threading.Event()
+    watcher = asyncio.create_task(watch_disconnect(request, cancel))
     try:
         touch()
-        await ensure_model()
         req = await request.json()
-        mode = req.get("mode", "fim")
-        result = await asyncio.to_thread(
-            proxy.complete,
-            prompt=req.get("prompt", ""),
-            max_tokens=req.get("max_tokens"),
-            temperature=req.get("temperature"),
-            stop=req.get("stop"),
-            top_p=req.get("top_p"),
-            top_k=req.get("top_k"),
-            repeat_penalty=req.get("repeat_penalty"),
-        )
-        text = result.get("text", "")
-        finish_reason = result.get("finish_reason", "stop")
-
-        # Handle mode-specific post-processing (same as Unix socket)
-        if mode == "fim":
-            suffix_lines = req.get("suffix_lines")
-            max_lines = req.get("max_lines", 21)
-            text = proxy.post_process_fim(text, finish_reason, suffix_lines, max_lines)
-            response_data = {"text": text, "finish_reason": finish_reason}
-        elif mode == "edit":
-            current_lines = req.get("current_lines")
-            cursor_offset = req.get("cursor_offset", 0)
-            proximity = req.get("proximity", 8)
-            updated_lines = proxy.post_process_edit(text, finish_reason, current_lines, cursor_offset, proximity)
-            response_data = {"updated_lines": updated_lines, "finish_reason": finish_reason}
-        else:
-            response_data = result
+        response_data, result = await run_completion(req, cancel)
 
         return JSONResponse({
             "id": f"cmpl-{uuid.uuid4().hex[:24]}",
@@ -510,8 +619,14 @@ async def completions(request: Request):
             **response_data,
             "usage": result.get("usage", {}),
         })
+    except Cancelled:
+        # 200 so the client sees the reason (curl --fail drops error bodies)
+        return JSONResponse({"error": "cancelled"})
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        cancel.set()
+        watcher.cancel()
 
 
 @app.get("/health")

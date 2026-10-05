@@ -4,19 +4,49 @@
 
 api = vim.api
 
+-- Edits to the same lines within this window are merged into one history
+-- entry, so typing a word doesn't fill the history with one entry per key
+COALESCE_NS = 1e9
+
+-- Replace snapshot[first+1 .. last] with new_lines in place
+splice = (snapshot, first, last, new_lines) ->
+    n = #snapshot
+    delta = #new_lines - (last - first)
+    if delta ~= 0 and last < n
+        table.move(snapshot, last + 1, n, last + 1 + delta)
+    if delta < 0
+        for i = n + delta + 1, n
+            snapshot[i] = nil
+    for i = 1, #new_lines
+        snapshot[first + i] = new_lines[i]
+    -- Deleting every line reports 0 new lines, but a buffer always keeps
+    -- one (empty) line
+    snapshot[1] = '' if #snapshot == 0
+
+lines_equal = (a, b) ->
+    return false unless #a == #b
+    for i = 1, #a
+        return false unless a[i] == b[i]
+    true
+
+whitespace_only = (a, b) ->
+    table.concat(a, '\n')\gsub('%s+', '') == table.concat(b, '\n')\gsub('%s+', '')
+
 export default class EditTracker
     config: nil
     max_edits: 6
     max_recent_files: 3
     context_file_lines: 60
+    max_file_lines: 10000
     -- Per-buffer data
     attached_bufs: {}       -- bufnr -> true (already attached)
-    original_contents: {}   -- bufnr -> {lines} (content when first opened)
     line_snapshots: {}      -- bufnr -> {lines} (last-known line content for diff)
     -- Global edit history (across buffers, most recent last)
     edit_history: {}
     -- Recently visited buffers (ordered, most recent last)
     recent_files: {}
+    -- Set by shutdown(); buffer callbacks then detach themselves
+    stopped: false
 
     new: (config) =>
         @config = config
@@ -24,35 +54,56 @@ export default class EditTracker
         @max_edits = ctx.max_edit_history or 6
         @max_recent_files = ctx.max_context_files or 3
         @context_file_lines = ctx.context_file_lines or 60
+        behavior = config.behavior or {}
+        @max_file_lines = behavior.max_file_lines or 10000
         @attached_bufs = {}
-        @original_contents = {}
         @line_snapshots = {}
         @edit_history = {}
         @recent_files = {}
+        @stopped = false
 
     -- Attach to a buffer to track changes
     attach: (bufnr) =>
         bufnr = bufnr or api.nvim_get_current_buf()
+        return if @stopped
         return if @attached_bufs[bufnr]
         return unless api.nvim_buf_is_valid(bufnr)
         return if vim.bo[bufnr].buftype ~= ''
+        -- Huge buffers are never completed, so don't pay for tracking them
+        return if @max_file_lines > 0 and
+            api.nvim_buf_line_count(bufnr) > @max_file_lines
 
-        -- Snapshot the full content as "original" (session baseline)
-        lines = api.nvim_buf_get_lines(bufnr, 0, -1, false)
-        @original_contents[bufnr] = vim.deepcopy(lines)
-        @line_snapshots[bufnr] = vim.deepcopy(lines)
+        -- Snapshot the full content; kept in sync by splicing each change
+        @line_snapshots[bufnr] = api.nvim_buf_get_lines(bufnr, 0, -1, false)
 
         self = @
         api.nvim_buf_attach(bufnr, false, {
             on_lines: (_, buf, _, first_line, last_line, new_last_line, ...) ->
+                -- Returning true detaches (after :SweepReload / shutdown)
+                return true if self.stopped
                 self\on_lines_changed(buf, first_line, last_line, new_last_line)
+                return
+
+            -- :edit! etc. replace the whole text without on_lines
+            on_reload: (_, buf) ->
+                return true if self.stopped
+                if self.line_snapshots[buf]
+                    self.line_snapshots[buf] = api.nvim_buf_get_lines(buf, 0, -1, false)
+                return
 
             on_detach: (_, buf) ->
+                return if self.stopped
                 self.attached_bufs[buf] = nil
                 self.line_snapshots[buf] = nil
         })
 
         @attached_bufs[bufnr] = true
+
+    -- Stop tracking: attached buffer callbacks detach on their next event
+    shutdown: () =>
+        @stopped = true
+        @attached_bufs = {}
+        @line_snapshots = {}
 
     -- Called by nvim_buf_attach when lines change
     -- first_line, last_line: 0-indexed range of OLD lines that were replaced
@@ -66,22 +117,34 @@ export default class EditTracker
         for i = first_line + 1, last_line
             table.insert(old_lines, snapshot[i] or '')
 
-        -- Read new lines from the buffer
+        -- Read only the replacement lines and keep the snapshot in sync,
+        -- even for changes that aren't recorded below
         new_lines = api.nvim_buf_get_lines(bufnr, first_line, new_last_line, false)
+        splice(snapshot, first_line, last_line, new_lines)
 
         -- Skip trivial changes (identical content)
-        if #old_lines == #new_lines
-            identical = true
-            for i = 1, #old_lines
-                if old_lines[i] ~= new_lines[i]
-                    identical = false
-                    break
-            return if identical
+        return if lines_equal(old_lines, new_lines)
+
+        now = vim.uv.hrtime()
+
+        -- Merge into the previous entry when this change rewrites exactly
+        -- the lines that entry produced (e.g. typing on one line)
+        last = @edit_history[#@edit_history]
+        if last and last.bufnr == bufnr and
+                last.start_line == first_line + 1 and
+                #last.new_lines == #old_lines and
+                now - last.timestamp < COALESCE_NS
+            if lines_equal(last.old_lines, new_lines)
+                -- Change was undone: nothing left to report
+                table.remove(@edit_history)
+            else
+                last.new_lines = new_lines
+                last.end_line = first_line + math.max(#last.old_lines, #new_lines)
+                last.timestamp = now
+            return
 
         -- Skip whitespace-only changes
-        old_text = table.concat(old_lines, '\n')\gsub('%s+', '')
-        new_text = table.concat(new_lines, '\n')\gsub('%s+', '')
-        return if old_text == new_text
+        return if whitespace_only(old_lines, new_lines)
 
         -- Record the edit
         filepath = api.nvim_buf_get_name(bufnr)
@@ -94,12 +157,13 @@ export default class EditTracker
             filepath = filepath\sub(#cwd + 2)
 
         edit = {
+            bufnr: bufnr
             filepath: filepath
             start_line: first_line + 1  -- 1-indexed for prompt
             end_line: first_line + math.max(#old_lines, #new_lines)
             old_lines: old_lines
             new_lines: new_lines
-            timestamp: vim.uv.hrtime()
+            timestamp: now
         }
 
         table.insert(@edit_history, edit)
@@ -107,9 +171,6 @@ export default class EditTracker
         -- Trim to MAX_EDITS
         while #@edit_history > @max_edits
             table.remove(@edit_history, 1)
-
-        -- Update snapshot to current buffer state
-        @line_snapshots[bufnr] = api.nvim_buf_get_lines(bufnr, 0, -1, false)
 
     -- Track buffer visit for recent files context
     track_visit: (bufnr) =>
@@ -193,7 +254,6 @@ export default class EditTracker
     -- Full cleanup
     clear: () =>
         @attached_bufs = {}
-        @original_contents = {}
         @line_snapshots = {}
         @edit_history = {}
         @recent_files = {}

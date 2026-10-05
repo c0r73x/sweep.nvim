@@ -37,6 +37,21 @@ http_request = (method, url, opts, timeout, callback) ->
         finish("timed out after #{timeout}ms")
     )
 
+-- Errors that retrying can't fix: the request was too slow, aborted, or
+-- the connection was deliberately dropped
+NO_RETRY_PATTERNS = { '[Tt]imed out', '^[Cc]ancelled', '^[Ss]uperseded', '^Disconnected' }
+
+is_retryable = (err) ->
+    msg = tostring(err)
+    for pat in *NO_RETRY_PATTERNS
+        return false if msg\find(pat)
+    true
+
+stop_close = (timer) ->
+    return unless timer
+    timer\stop()
+    timer\close() unless timer\is_closing()
+
 export default class SweepClient
     config: nil
     -- Unix socket transport
@@ -44,8 +59,15 @@ export default class SweepClient
     connected: false
     connecting: false
     read_buffer: ''
-    pending_callback: nil
     sock_path: nil
+    -- Callbacks waiting for an in-progress connect
+    connect_waiters: {}
+    -- In-flight socket requests: id -> { callback, timer }. Requests carry
+    -- an id the proxy echoes back; replies without one (older proxies,
+    -- which answer in order) go to the oldest request in pending_order.
+    pending: {}
+    pending_order: {}
+    next_id: 0
     -- State
     transport: nil  -- 'socket' | 'http' | nil
     retry_count: 0
@@ -57,7 +79,10 @@ export default class SweepClient
         @connected = false
         @connecting = false
         @read_buffer = ''
-        @pending_callback = nil
+        @connect_waiters = {}
+        @pending = {}
+        @pending_order = {}
+        @next_id = 0
         @retry_count = 0
         @max_retries = 3
         @transport = nil
@@ -80,89 +105,148 @@ export default class SweepClient
         if log_level == 'debug' or (level and level >= vim.log.levels.WARN)
             pcall(vim.notify, "Sweep: #{msg}", level or vim.log.levels.INFO)
 
+    is_debug: () => @config and @config.log_level == 'debug'
+
     -- ---------------------------------------------------------------
     -- Unix socket transport
     -- ---------------------------------------------------------------
+
+    -- Run every callback queued during a connect attempt
+    _flush_waiters: (ok, err) =>
+        waiters = @connect_waiters
+        @connect_waiters = {}
+        for cb in *waiters
+            cb(ok, err)
+
+    -- Complete one in-flight request; late or unknown ids are ignored
+    _resolve: (id, response, err) =>
+        entry = @pending[id]
+        return unless entry
+        @pending[id] = nil
+        for i, pid in ipairs(@pending_order)
+            if pid == id
+                table.remove(@pending_order, i)
+                break
+        stop_close(entry.timer)
+        vim.schedule(-> entry.callback(response, err))
+
+    -- Fail every in-flight request (connection lost or dropped)
+    _fail_pending: (err) =>
+        ids = @pending_order
+        @pending_order = {}
+        pending = @pending
+        @pending = {}
+        for id in *ids
+            entry = pending[id]
+            if entry
+                stop_close(entry.timer)
+                vim.schedule(-> entry.callback(nil, err))
+
+    _on_message: (msg) =>
+        ok, response = pcall(vim.json.decode, msg)
+        id = ok and type(response) == 'table' and response.id or nil
+        if id == nil or id == vim.NIL
+            -- No id: reply to the oldest request (proxies answer in order)
+            id = @pending_order[1]
+        return unless id
+        if ok
+            @_resolve(id, response, nil)
+        else
+            @_resolve(id, nil, "JSON parse error")
+
     socket_connect: (callback) =>
         return callback(true) if @connected
+
+        -- Queue behind a connect already in progress instead of dropping
+        -- the callback (which left the request unanswered forever)
+        table.insert(@connect_waiters, callback)
         return if @connecting
 
         unless uv.fs_stat(@sock_path)
-            callback(false, "Socket not found: #{@sock_path}")
+            @_flush_waiters(false, "Socket not found: #{@sock_path}")
             return
 
         @connecting = true
-        @pipe = uv.new_pipe(false)
+        pipe = uv.new_pipe(false)
+        @pipe = pipe
         self = @
 
-        @pipe\connect(@sock_path, (err) ->
+        pipe\connect(@sock_path, (err) ->
+            -- Superseded by disconnect() while connecting
+            if self.pipe ~= pipe
+                pipe\close() unless pipe\is_closing()
+                return
             self.connecting = false
             if err
-                self.pipe\close() if self.pipe and not self.pipe\is_closing()
+                pipe\close() unless pipe\is_closing()
                 self.pipe = nil
                 self.connected = false
-                vim.schedule(-> callback(false, "Socket connect: #{err}"))
+                vim.schedule(-> self\_flush_waiters(false, "Socket connect: #{err}"))
             else
                 self.connected = true
                 self.transport = 'socket'
                 self.read_buffer = ''
-                self.pipe\read_start((read_err, data) ->
+                pipe\read_start((read_err, data) ->
+                    return unless self.pipe == pipe
                     if read_err or not data
                         self.connected = false
                         self.transport = nil
-                        if self.pipe and not self.pipe\is_closing()
-                            self.pipe\close()
+                        pipe\close() unless pipe\is_closing()
                         self.pipe = nil
-                        if self.pending_callback
-                            cb = self.pending_callback
-                            self.pending_callback = nil
-                            vim.schedule(-> cb(nil, "Connection lost"))
+                        self.read_buffer = ''
+                        self\_fail_pending("Connection lost")
                         return
 
                     self.read_buffer ..= data
                     while true
-                        nl = self.read_buffer\find('\n')
+                        nl = self.read_buffer\find('\n', 1, true)
                         break unless nl
                         msg = self.read_buffer\sub(1, nl - 1)
                         self.read_buffer = self.read_buffer\sub(nl + 1)
-                        ok, response = pcall(vim.json.decode, msg)
-                        if ok and self.pending_callback
-                            cb = self.pending_callback
-                            self.pending_callback = nil
-                            vim.schedule(-> cb(response, nil))
-                        elseif not ok and self.pending_callback
-                            cb = self.pending_callback
-                            self.pending_callback = nil
-                            vim.schedule(-> cb(nil, "JSON parse error"))
+                        self\_on_message(msg)
                 )
                 vim.schedule(->
                     self\log("Connected via Unix socket")
-                    callback(true)
+                    self\_flush_waiters(true)
                 )
         )
 
-    socket_send: (request, callback) =>
+    -- callback(response, err) runs on the main loop. timeout (ms) fails the
+    -- request and drops the connection, so a late reply can't be paired
+    -- with a later request and the proxy aborts the generation.
+    socket_send: (request, callback, timeout) =>
         unless @connected and @pipe
             callback(nil, "Not connected")
             return
 
-        if @pending_callback
-            callback(nil, "Request already pending")
-            return
+        @next_id += 1
+        id = @next_id
+        request.id = id
 
-        @pending_callback = callback
+        timer = nil
+        if timeout and timeout > 0
+            timer = uv.new_timer()
+            timer\start(timeout, 0, ->
+                vim.schedule(->
+                    return unless @pending[id]
+                    @_resolve(id, nil, "Timed out after #{timeout}ms")
+                    @disconnect()
+                )
+            )
+
+        @pending[id] = { callback: callback, timer: timer }
+        table.insert(@pending_order, id)
+
         data = vim.json.encode(request) .. '\n'
         ok, err = pcall(-> @pipe\write(data))
         unless ok
-            @pending_callback = nil
-            @connected = false
-            @transport = nil
-            callback(nil, "Write failed: #{err}")
+            @_resolve(id, nil, "Write failed: #{err}")
+            @disconnect()
 
     -- ---------------------------------------------------------------
     -- HTTP transport (fallback)
     -- ---------------------------------------------------------------
-    http_send: (request, callback) =>
+    http_send: (request, callback, timeout) =>
         url = "#{@config.provider.url}/v1/completions"
         -- Build request body with all fields
         body_dict = {
@@ -190,7 +274,7 @@ export default class SweepClient
         body = vim.json.encode(body_dict)
 
         -- Use request-specific timeout or config default
-        timeout = request.timeout or @config.provider.completion_timeout or 5000
+        timeout = timeout or request.timeout or @config.provider.completion_timeout or 5000
 
         http_request('POST', url, {
             body: body
@@ -205,9 +289,9 @@ export default class SweepClient
                 callback(nil, "HTTP JSON parse error")
                 return
 
-            -- Handle new response format
-            if response.error
-                callback(nil, response.error)
+            -- FastAPI reports errors as { detail: ... }
+            if response.error or response.detail
+                callback(nil, response.error or response.detail)
                 return
 
             -- Return response as-is for unified handling
@@ -217,7 +301,7 @@ export default class SweepClient
     -- ---------------------------------------------------------------
     -- Unified send
     -- ---------------------------------------------------------------
-    send: (request, callback) =>
+    send: (request, callback, timeout) =>
         -- If on HTTP fallback, periodically retry socket
         if @transport == 'http'
             @_http_request_count = (@_http_request_count or 0) + 1
@@ -225,32 +309,47 @@ export default class SweepClient
                 @_http_request_count = 0
                 @transport = nil  -- Allow socket retry
             else
-                @http_send(request, callback)
+                @http_send(request, callback, timeout)
                 return
 
         if @connected and @transport == 'socket'
-            @socket_send(request, callback)
+            @socket_send(request, callback, timeout)
             return
 
         @socket_connect((ok, err) ->
             if ok
-                @socket_send(request, callback)
+                @socket_send(request, callback, timeout)
+            elseif request.type == 'health'
+                -- No HTTP equivalent of a socket health request
+                callback(nil, err)
             else
                 @log("Socket unavailable (#{err}), using HTTP fallback")
                 @transport = 'http'
                 @_http_request_count = 0
-                @http_send(request, callback)
+                @http_send(request, callback, timeout)
         )
 
+    -- Ask the proxy to abort this instance's running generation (its
+    -- request then fails with "cancelled"). Socket only; over HTTP the
+    -- next request from this instance supersedes the old one instead.
+    cancel: () =>
+        return unless @connected and @transport == 'socket' and next(@pending)
+        -- Registered like any request so in-order replies stay paired
+        -- (older proxies answer it with an "Unknown type" error)
+        @socket_send({ type: 'cancel', instance_id: INSTANCE_ID }, (->), nil)
+
     disconnect: () =>
+        @connecting = false
         if @pipe and not @pipe\is_closing()
             @pipe\read_stop() if @connected
             @pipe\close()
         @pipe = nil
         @connected = false
         @transport = nil
-        @pending_callback = nil
         @read_buffer = ''
+        -- Answer everything still waiting so callers don't stay "processing"
+        @_fail_pending("Disconnected")
+        @_flush_waiters(false, "Disconnected")
 
     -- ---------------------------------------------------------------
     -- Public API
@@ -265,12 +364,12 @@ export default class SweepClient
                     @transport = 'http'
             )
         else
-            @send({ type: 'health' }, (response, err) ->
+            @send({ type: 'health' }, ((response, err) ->
                 if err
                     @log("Proxy not responding: #{err}", vim.log.levels.WARN)
                 elseif response and response.status == 'ok'
                     @log("Sweep proxy is healthy (socket)", vim.log.levels.INFO)
-            )
+            ), 5000)
 
     -- FIM completion: inline text at cursor position
     -- Returns a string completion via callback(text, err)
@@ -336,7 +435,7 @@ export default class SweepClient
             current_lines: current_lines_param
             cursor_offset: cursor_offset_param
             proximity: proximity_param
-        }, (response, err) ->
+        }, ((response, err) ->
             if err
                 @handle_error(err, mode, context, tracker, callback)
                 return
@@ -357,7 +456,7 @@ export default class SweepClient
             else
                 updated_lines = response and response.updated_lines or {}
                 -- Ensure updated_lines is a table of strings
-                @log("Edit response: #{vim.inspect(response)}")
+                @log("Edit response: #{vim.inspect(response)}") if @is_debug()
                 if type(updated_lines) == 'table' and #updated_lines > 0
                     @log("Got #{#updated_lines} lines from model (#{mode})")
                     callback(updated_lines, nil)
@@ -365,10 +464,10 @@ export default class SweepClient
                     -- Normal: the model often has no edit to suggest
                     @log("Empty edit response from model")
                     callback(nil, nil)
-        )
+        ), timeout)
 
     handle_error: (err, mode, context, tracker, callback) =>
-        if @retry_count < @max_retries
+        if is_retryable(err) and @retry_count < @max_retries
             @retry_count += 1
             delay = math.pow(2, @retry_count) * 100
             @log("Retry #{@retry_count}/#{@max_retries} in #{delay}ms: #{err}")
@@ -376,8 +475,9 @@ export default class SweepClient
                 @disconnect()
             vim.defer_fn((-> @request_completion(mode, context, tracker, callback)), delay)
         else
+            if @retry_count > 0
+                @log("Max retries exceeded: #{err}", vim.log.levels.WARN)
             @retry_count = 0
-            @log("Max retries exceeded: #{err}", vim.log.levels.WARN)
             callback(nil, err)
 
     -- ---------------------------------------------------------------

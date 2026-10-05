@@ -3,11 +3,14 @@
 api = vim.api
 
 -- Accept completion callback for expr mappings
+-- Expr mappings run under textlock, so the buffer is changed right after
+-- the mapping returns instead of inside it
 make_accept_callback = (key) ->
     () ->
         ct = _G.sweep
-        if ct and ct.ghost_text and ct.ghost_text\has_completion()
-            return ct\accept()
+        if ct and ct.ghost_text and ct.ghost_text\has_completion() and ct\can_accept()
+            vim.schedule(-> ct\accept())
+            return ''
         else
             return key
 
@@ -15,9 +18,7 @@ make_accept_callback = (key) ->
 trigger_callback = () ->
     ct = _G.sweep
     if ct and ct.ghost_text
-        bufnr = api.nvim_get_current_buf()
-        ct.buffer_state\update_state(bufnr)
-        ct\trigger_completion(bufnr)
+        ct\trigger_completion(api.nvim_get_current_buf())
 
 -- Normal mode accept
 normal_accept_callback = () ->

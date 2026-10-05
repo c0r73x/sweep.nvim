@@ -1,5 +1,8 @@
 -- Sweep Configuration
 
+-- Plugin root (<root>/lua/sweep/config.lua) for the bundled proxy script
+PLUGIN_ROOT = vim.fn.fnamemodify(debug.getinfo(1, 'S').source\sub(2), ':p:h:h:h')
+
 IGNORE_FILETYPES = {
     'aerial', 'alpha', 'cfg', 'cmp_docs', 'cmp_menu', 'codecompanion_popup',
     'conf', 'dbui', 'diff', 'fzf', 'git', 'help', 'lazy', 'list', 'lspinfo',
@@ -63,7 +66,7 @@ export default class Config
             -- Connection settings
             completion_timeout: 5000    -- ms before giving up on a request
             auto_start: true            -- Auto-start proxy on VeryLazy
-            proxy_script: "#{vim.fn.stdpath('config')}/scripts/sweep/sweep_proxy.py"
+            proxy_script: "#{PLUGIN_ROOT}/proxy/sweep_proxy.py"
             model_path: nil             -- Path to GGUF model (nil = proxy default)
             env: nil                    -- Extra environment for the proxy process
         }

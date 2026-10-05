@@ -137,6 +137,7 @@ export default class BufferState
         state.bufnr = bufnr
         state.filepath = api.nvim_buf_get_name(bufnr)
         state.filetype = vim.bo[bufnr].filetype
+        state.changedtick = api.nvim_buf_get_changedtick(bufnr)
         state.timestamp = vim.uv.hrtime()
         @buffer_states[bufnr] = state
 
@@ -177,35 +178,41 @@ export default class BufferState
             window_start: current.start_line
             window_end: current.end_line
             cursor_offset: current.cursor_offset
+            -- Buffer version the window was read at; responses and accepts
+            -- for an older version are stale
+            changedtick: state.changedtick
             timestamp: state.timestamp
         }
 
     -- Apply the model's updated lines to the buffer using diff hunks
     -- This ensures only the changed lines are modified, matching the ghost text preview
+    -- Returns false (and changes nothing) when the buffer changed since
+    -- the context was taken, as the hunk positions would be wrong
     apply_update: (bufnr, context, updated_lines) =>
         bufnr = bufnr or api.nvim_get_current_buf()
-        return unless context and updated_lines and #updated_lines > 0
+        return false unless context and updated_lines and #updated_lines > 0
+        return false unless api.nvim_buf_is_valid(bufnr)
+        if context.changedtick and
+                api.nvim_buf_get_changedtick(bufnr) ~= context.changedtick
+            return false
 
         Diff = require('sweep.diff')
         current_lines = context.current_lines or {}
         result = Diff.diff(current_lines, updated_lines)
 
-        return unless result.has_changes
+        return false unless result.has_changes
 
         start_line = context.window_start
 
         -- Apply hunks in reverse order so indices stay valid
         for i = #result.hunks, 1, -1
             hunk = result.hunks[i]
-            if hunk.first_old_idx
-                -- Buffer line = window offset + start_line - 1 (0-based for nvim API)
-                buf_line = start_line - 1 + hunk.first_old_idx - 1
-                -- Remove deleted lines, insert added lines
-                api.nvim_buf_set_lines(bufnr, buf_line, buf_line + #hunk.deletes, false, hunk.adds)
-            elseif hunk.first_new_idx
-                -- Pure insertion: insert at the corresponding position
-                buf_line = start_line - 1 + math.min(hunk.first_new_idx - 1, #current_lines)
-                api.nvim_buf_set_lines(bufnr, buf_line, buf_line, false, hunk.adds)
+            -- Buffer line = window offset + start_line - 1 (0-based for nvim
+            -- API); old_start is also set for pure insertions, so adds land
+            -- before the right old line
+            buf_line = start_line - 1 + hunk.old_start - 1
+            api.nvim_buf_set_lines(bufnr, buf_line, buf_line + #hunk.deletes, false, hunk.adds)
 
         -- Re-snapshot as new original after accepting
         @snapshot_original(bufnr)
+        return true

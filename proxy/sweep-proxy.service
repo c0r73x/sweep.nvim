@@ -2,18 +2,22 @@
 Description=Sweep AI Code Completion Proxy
 After=network.target
 
+# User unit: install to ~/.config/systemd/user/ and adjust the paths below
+# if the plugin isn't installed by lazy.nvim (%h is your home directory).
+# The proxy writes its own log to ~/.local/state/sweep-proxy.log (SWEEP_LOG).
+
 [Service]
 Type=simple
-User=%USER%
-WorkingDirectory=/home/%USER%/.config/nvim/scripts/sweep
-ExecStart=/usr/bin/python3 /home/%USER%/.config/nvim/scripts/sweep/sweep_proxy.py
-Restart=always
+WorkingDirectory=%h/.local/share/nvim/lazy/sweep.nvim/proxy
+ExecStart=/usr/bin/python3 %h/.local/share/nvim/lazy/sweep.nvim/proxy/sweep_proxy.py
+Restart=on-failure
 RestartSec=5
-StandardOutput=append:/home/%USER%/.local/state/nvim/sweep_proxy.log
-StandardError=append:/home/%USER%/.local/state/nvim/sweep_proxy.err
 
 # Environment
 Environment="PATH=/usr/bin:/bin:/usr/local/bin"
+# Don't exit when idle: systemd owns the lifetime here
+Environment="SWEEP_IDLE_TIMEOUT=0"
+# Environment="MODEL_PATH=%h/path/to/sweep-next-edit-1.5b.q8_0.v2.gguf"
 
 [Install]
 WantedBy=default.target

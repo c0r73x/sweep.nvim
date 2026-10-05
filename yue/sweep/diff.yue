@@ -18,6 +18,8 @@ compute_lcs = (a, b) ->
     return dp
 
 -- Backtrack LCS table to produce edit operations
+-- Add ops record old_idx too: the old line they are inserted before
+-- (i + 1 = #a + 1 when appending), so pure insertions keep their anchor
 backtrack = (dp, a, b) ->
     ops = {}
     i, j = #a, #b
@@ -28,7 +30,7 @@ backtrack = (dp, a, b) ->
             i -= 1
             j -= 1
         elseif j > 0 and (i == 0 or dp[i][j-1] >= dp[i-1][j])
-            table.insert(ops, 1, { type: 'add', new_idx: j, text: b[j] })
+            table.insert(ops, 1, { type: 'add', old_idx: i + 1, new_idx: j, text: b[j] })
             j -= 1
         else
             table.insert(ops, 1, { type: 'delete', old_idx: i, text: a[i] })
@@ -37,6 +39,9 @@ backtrack = (dp, a, b) ->
     return ops
 
 -- Group consecutive operations into hunks for easier rendering
+-- old_start: 1-indexed old line where the hunk starts; deleted lines are
+-- old_start .. old_start + #deletes - 1 and adds replace them (for a pure
+-- insertion the adds go before old line old_start)
 group_hunks = (ops) ->
     hunks = {}
     current_hunk = nil
@@ -48,7 +53,10 @@ group_hunks = (ops) ->
                 current_hunk = nil
         else
             unless current_hunk
-                current_hunk = { deletes: {}, adds: {}, first_old_idx: nil, first_new_idx: nil }
+                current_hunk = {
+                    deletes: {}, adds: {}, old_start: op.old_idx
+                    first_old_idx: nil, first_new_idx: nil
+                }
             if op.type == 'delete'
                 table.insert(current_hunk.deletes, op.text)
                 current_hunk.first_old_idx = current_hunk.first_old_idx or op.old_idx
@@ -93,18 +101,12 @@ export default {
         -- Apply hunks in reverse order to preserve indices
         for i = #hunks, 1, -1
             hunk = hunks[i]
-            if hunk.first_old_idx
-                -- Remove deleted lines
-                for j = 1, #hunk.deletes
-                    table.remove(result, hunk.first_old_idx)
-                -- Insert added lines at the same position
-                for j = #hunk.adds, 1, -1
-                    table.insert(result, hunk.first_old_idx, hunk.adds[j])
-            elseif hunk.first_new_idx
-                -- Pure additions (insertions)
-                insert_at = math.min(hunk.first_new_idx, #result + 1)
-                for j = #hunk.adds, 1, -1
-                    table.insert(result, insert_at, hunk.adds[j])
+            at = math.min(hunk.old_start, #result + 1)
+            -- Remove deleted lines, then insert added lines in their place
+            for j = 1, #hunk.deletes
+                table.remove(result, at)
+            for j = #hunk.adds, 1, -1
+                table.insert(result, at, hunk.adds[j])
 
         return result
 }

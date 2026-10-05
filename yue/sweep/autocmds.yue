@@ -2,45 +2,74 @@
 
 api = vim.api
 
--- Safely stop and close a uv timer, handling already-closed handles
--- _debounce_timer may be: nil, a uv_timer_t handle, or `true` (sentinel
--- left by CursorHold to prevent re-triggering while stationary).
+-- One uv timer per Sweep instance, reused for the TextChangedI debounce
+-- and the CursorHold edit delay (restarting a timer is far cheaper than
+-- creating and closing one per keystroke).
+-- _timer_token invalidates callbacks that already fired but are still
+-- waiting in the schedule queue when the timer is stopped/restarted.
+-- _hold_fired stays set after a CursorHold request until the cursor moves,
+-- so a stationary cursor doesn't re-trigger edit predictions.
+start_timer = (ct, delay, fn) ->
+    timer = ct._debounce_timer
+    if not timer or timer\is_closing()
+        timer = vim.uv.new_timer()
+        ct._debounce_timer = timer
+    token = (ct._timer_token or 0) + 1
+    ct._timer_token = token
+    ct._timer_armed = true
+    timer\start(delay, 0, ->
+        vim.schedule(->
+            return unless ct._timer_token == token
+            ct._timer_armed = false
+            fn()
+        )
+    )
+
 stop_timer = (ct) ->
     timer = ct._debounce_timer
-    ct._debounce_timer = nil
-    if timer and type(timer) == 'userdata'
-        pcall(->
-            unless timer\is_closing()
-                timer\stop()
-                timer\close()
-        )
+    timer\stop() if timer and not timer\is_closing()
+    ct._timer_token = (ct._timer_token or 0) + 1
+    ct._timer_armed = false
+    ct._hold_fired = false
 
 -- Callback functions
 text_changed_callback = () ->
     ct = _G.sweep
     return unless ct and ct.config.enabled
 
+    -- The shown completion no longer matches the text
+    ct\reject()
+
     delay = ct.config.behavior.text_change_debounce
     bufnr = api.nvim_get_current_buf()
 
-    -- Stop existing debounce timer
-    stop_timer(ct)
-
-    -- Update buffer state immediately so context is fresh
-    ct.buffer_state\update_state(bufnr)
-
+    -- Buffer state is read in trigger_completion (after the debounce and
+    -- the validity checks), not on every keystroke
     if delay > 0
-        timer = vim.uv.new_timer()
-        timer\start(delay, 0, vim.schedule_wrap(->
-            timer\stop()
-            if not timer\is_closing()
-                timer\close()
-            ct._debounce_timer = nil
+        start_timer(ct, delay, ->
+            return unless api.nvim_get_current_buf() == bufnr
             ct\trigger_completion(bufnr)
-        ))
-        ct._debounce_timer = timer
+        )
     else
+        stop_timer(ct)
         ct\trigger_completion(bufnr)
+
+-- Normal mode text change (undo, paste, ...): predictions are stale
+text_changed_normal_callback = () ->
+    ct = _G.sweep
+    return unless ct
+    ct\reject()
+
+-- Insert mode cursor move: FIM ghost text is only valid at its position
+cursor_moved_insert_callback = () ->
+    ct = _G.sweep
+    return unless ct
+    gt = ct.ghost_text
+    return unless gt and gt.visible
+    pos = api.nvim_win_get_cursor(0)
+    unless api.nvim_get_current_buf() == gt.current_bufnr and
+            pos[1] == gt.current_line and pos[2] == gt.current_col
+        ct\reject()
 
 insert_enter_callback = () ->
     ct = _G.sweep
@@ -48,9 +77,9 @@ insert_enter_callback = () ->
     bufnr = api.nvim_get_current_buf()
     -- Clear any existing edit predictions when entering insert mode
     ct\reject()
+    stop_timer(ct)
     -- Snapshot original state for sweep prompt (original vs current)
     ct.buffer_state\snapshot_original(bufnr)
-    ct.buffer_state\update_state(bufnr)
 
 insert_leave_callback = () ->
     ct = _G.sweep
@@ -77,7 +106,7 @@ cursor_moved_normal_callback = () ->
     mode = vim.api.nvim_get_mode().mode
     if mode == 'n' and ct.config.behavior.hide_on_cursor_move
         ct\reject()
-    
+
     -- Clear debounce timer when cursor moves
     stop_timer(ct)
 
@@ -93,35 +122,28 @@ cursor_hold_callback = () ->
     return unless mode == 'n'
     return if ct\is_processing()
     return if ct.ghost_text\has_cursor_prediction()
-    
-    -- Don't trigger if we already have a pending timer
-    return if ct._debounce_timer
+
+    -- Don't trigger if a timer is pending or already fired at this spot
+    return if ct._timer_armed or ct._hold_fired
 
     -- Use edit prediction delay (default 1000ms)
     delay = ct.config.behavior.edit_prediction_delay or 1000
 
     bufnr = api.nvim_get_current_buf()
+    return unless ct.buffer_state\is_valid_buffer(bufnr)
     -- Only snapshot if we don't already have one from InsertEnter.
     -- Overwriting would make original == current, losing the pre-edit baseline.
     state = ct.buffer_state.buffer_states[bufnr]
     unless state and state.original_all_lines
         ct.buffer_state\snapshot_original(bufnr)
-    ct.buffer_state\update_state(bufnr)
 
-    timer = vim.uv.new_timer()
-    timer\start(delay, 0, vim.schedule_wrap(->
-        timer\stop()
-        if not timer\is_closing()
-            timer\close()
-        -- Replace handle with sentinel so stop_timer() won't call
-        -- methods on a closed handle, but the truthy value still
-        -- prevents re-triggering while the cursor is stationary.
-        ct._debounce_timer = true
+    start_timer(ct, delay, ->
+        ct._hold_fired = true
         -- Double-check we're still in normal mode and not processing
-        if vim.api.nvim_get_mode().mode == 'n' and not ct\is_processing()
+        if api.nvim_get_current_buf() == bufnr and
+                vim.api.nvim_get_mode().mode == 'n' and not ct\is_processing()
             ct\trigger_completion(bufnr)
-    ))
-    ct._debounce_timer = timer
+    )
 
 buf_enter_callback = () ->
     ct = _G.sweep
@@ -131,17 +153,24 @@ buf_enter_callback = () ->
     ct.tracker\attach(bufnr)
     -- Record as recently visited for context files
     ct.tracker\track_visit(bufnr)
-    ct.buffer_state\update_state(bufnr)
 
 buf_leave_callback = () ->
     ct = _G.sweep
     return unless ct
+    ct\reject()
+    stop_timer(ct)
     -- Only clear transient window state, preserve original_all_lines
     -- so edit mode retains its baseline across buffer switches
     bufnr = api.nvim_get_current_buf()
     state = ct.buffer_state.buffer_states[bufnr]
     if state
         state.current_window = nil
+
+-- Autocmd callbacks that return a truthy value are deleted (and Yue
+-- returns the last expression implicitly), so never return anything
+no_return = (fn) -> (args) ->
+    fn(args)
+    return
 
 -- Check port availability asynchronously
 check_port_listening = (port, on_listening, on_free) ->
@@ -212,53 +241,65 @@ very_lazy_callback = () ->
     )
 
 export default {
+    stop_timer: stop_timer
+
     setup_autocmds: (sweep) ->
         augroup = api.nvim_create_augroup('sweep', { clear: true })
 
         api.nvim_create_autocmd('TextChangedI', {
             group: augroup
-            callback: text_changed_callback
+            callback: no_return(text_changed_callback)
+        })
+
+        api.nvim_create_autocmd('TextChanged', {
+            group: augroup
+            callback: no_return(text_changed_normal_callback)
+        })
+
+        api.nvim_create_autocmd('CursorMovedI', {
+            group: augroup
+            callback: no_return(cursor_moved_insert_callback)
         })
 
         api.nvim_create_autocmd('InsertEnter', {
             group: augroup
-            callback: insert_enter_callback
+            callback: no_return(insert_enter_callback)
         })
 
         api.nvim_create_autocmd('InsertLeave', {
             group: augroup
-            callback: insert_leave_callback
+            callback: no_return(insert_leave_callback)
         })
 
         api.nvim_create_autocmd('ModeChanged', {
             group: augroup
-            callback: mode_changed_callback
+            callback: no_return(mode_changed_callback)
         })
 
         api.nvim_create_autocmd('CursorHold', {
             group: augroup
-            callback: cursor_hold_callback
+            callback: no_return(cursor_hold_callback)
         })
 
         api.nvim_create_autocmd('CursorMoved', {
             group: augroup
-            callback: cursor_moved_normal_callback
+            callback: no_return(cursor_moved_normal_callback)
         })
 
         api.nvim_create_autocmd('BufEnter', {
             group: augroup
-            callback: buf_enter_callback
+            callback: no_return(buf_enter_callback)
         })
 
         api.nvim_create_autocmd('BufLeave', {
             group: augroup
-            callback: buf_leave_callback
+            callback: no_return(buf_leave_callback)
         })
 
         api.nvim_create_autocmd('User', {
             group: augroup
             pattern: 'VeryLazy'
-            callback: very_lazy_callback
+            callback: no_return(very_lazy_callback)
         })
 
         -- If VeryLazy already fired (plugin loaded by VeryLazy event),
