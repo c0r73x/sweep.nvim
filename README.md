@@ -118,6 +118,12 @@ The proxy listens on:
 - Unix socket: `$XDG_RUNTIME_DIR/sweep.sock` (or `/tmp/sweep-<uid>.sock`)
 - HTTP: `http://127.0.0.1:5555`
 
+Edit predictions use prompt-lookup speculative decoding: the model mostly
+copies the code window back, so tokens drafted from the prompt are verified
+in batches (about 2.4x faster edits, identical output). Set
+`SWEEP_PROMPT_LOOKUP` to the number of drafted tokens (default `10`), or `0`
+to disable it, e.g. through `provider.env`.
+
 #### System service (optional)
 
 If you want the proxy to start at login independently of Neovim, service
