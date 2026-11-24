@@ -86,10 +86,10 @@ export default class EditTracker
 
         self = @
         api.nvim_buf_attach(bufnr, false, {
-            on_lines: (_, buf, _, first_line, last_line, new_last_line, ...) ->
+            on_lines: (_, buf, tick, first_line, last_line, new_last_line, ...) ->
                 -- Returning true detaches (after :SweepReload / shutdown)
                 return true if self.stopped
-                self\on_lines_changed(buf, first_line, last_line, new_last_line)
+                self\on_lines_changed(buf, first_line, last_line, new_last_line, tick)
                 return
 
             -- :edit! etc. replace the whole text without on_lines
@@ -116,7 +116,8 @@ export default class EditTracker
     -- Called by nvim_buf_attach when lines change
     -- first_line, last_line: 0-indexed range of OLD lines that were replaced
     -- new_last_line: 0-indexed end of the NEW replacement range
-    on_lines_changed: (bufnr, first_line, last_line, new_last_line) =>
+    -- tick: the buffer's changedtick after the change
+    on_lines_changed: (bufnr, first_line, last_line, new_last_line, tick) =>
         snapshot = @line_snapshots[bufnr]
         return unless snapshot
 
@@ -150,6 +151,7 @@ export default class EditTracker
                 last.new_lines = new_lines
                 last.end_line = first_line + math.max(#last.old_lines, #new_lines)
                 last.timestamp = now
+                last.tick = tick
             return
 
         -- Skip whitespace-only changes
@@ -173,6 +175,7 @@ export default class EditTracker
             old_lines: old_lines
             new_lines: new_lines
             timestamp: now
+            tick: tick
         }
 
         table.insert(@edit_history, edit)
@@ -223,9 +226,14 @@ export default class EditTracker
 
     -- Get formatted diff sections for the sweep prompt
     -- Returns list of strings, each a complete <|file_sep|>...original:...updated: block
-    get_diff_sections: () =>
+    -- Edits to bufnr made after its changedtick since_tick are left out: the
+    -- prompt already shows them as original -> current, and the model reads
+    -- a change that is also in the history as done, predicting nothing.
+    get_diff_sections: (bufnr, since_tick) =>
         sections = {}
         for _, edit in ipairs(@edit_history)
+            continue if since_tick and edit.bufnr == bufnr and
+                edit.tick and edit.tick > since_tick
             parts = {}
             table.insert(parts, "<|file_sep|>#{edit.filepath}.diff")
             table.insert(parts, "original:")

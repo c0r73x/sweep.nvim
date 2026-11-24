@@ -69,6 +69,5 @@ Managed server socket: `$XDG_RUNTIME_DIR/sweep-server.sock` or `/tmp/sweep-serve
 Headless, no framework:
 
 ```bash
-nvim --headless --clean --cmd 'set rtp^=.' -l tests/postprocess_test.lua
-nvim --headless --clean --cmd 'set rtp^=.' -l tests/diff_test.lua
+for t in tests/*_test.lua; do nvim --headless --clean --cmd 'set rtp^=.' -l "$t"; done
 ```

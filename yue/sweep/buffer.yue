@@ -196,6 +196,8 @@ export default class BufferState
             line_content: state.line_content
             -- Window data for edit mode
             original_lines: original_lines
+            -- changedtick of the original snapshot (nil: none taken yet)
+            original_tick: state.original_tick
             current_lines: current.lines
             window_start: current.start_line
             window_end: current.end_line

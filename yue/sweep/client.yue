@@ -235,8 +235,12 @@ export default class SweepClient
         original_lines = context.original_lines or {}
         current_lines = context.current_lines or {}
 
+        -- Recent edits, minus those to this buffer since the original
+        -- snapshot (they are the original -> current change below)
+        diff_sections = tracker and tracker\get_diff_sections(context.bufnr, context.original_tick) or {}
+
         -- Check if there's any edit signal for the model to work with
-        has_diff_history = tracker and #tracker.edit_history > 0
+        has_diff_history = #diff_sections > 0
         has_buffer_changes = false
         if #original_lines == #current_lines
             for i = 1, #original_lines
@@ -259,10 +263,8 @@ export default class SweepClient
                     table.insert(parts, line)
 
         -- 2. Recent edit diffs
-        if tracker
-            diff_sections = tracker\get_diff_sections()
-            for _, section in ipairs(diff_sections)
-                table.insert(parts, section)
+        for _, section in ipairs(diff_sections)
+            table.insert(parts, section)
 
         -- 3. Treesitter context (enclosing scope + imports)
         ts_context = @get_treesitter_context(context)
