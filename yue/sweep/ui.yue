@@ -121,61 +121,82 @@ export default class GhostText
             @visible = true
             @show_time = vim.uv.hrtime()
 
+    -- Walk the hunk in display order: paired lines get their inline
+    -- changes, unpaired deleted lines are highlighted, and added lines
+    -- become virtual lines below the old line they follow (above the
+    -- first line when inserting at the buffer top)
     render_hunk: (hunk, window_start) =>
         bufnr = @current_bufnr
-        has_deletes = #hunk.deletes > 0
-        has_adds = #hunk.adds > 0
-
-        if has_deletes and has_adds
-            @render_modification(hunk, window_start, bufnr)
-        elseif has_deletes
-            @render_deletion(hunk, window_start, bufnr)
-        elseif has_adds
-            @render_addition(hunk, window_start, bufnr)
-
-    render_modification: (hunk, window_start, bufnr) =>
-        @render_deletion(hunk, window_start, bufnr)
-        @render_addition(hunk, window_start, bufnr)
-
-    render_deletion: (hunk, window_start, bufnr) =>
         total_lines = api.nvim_buf_line_count(bufnr)
-        for i = 0, #hunk.deletes - 1
-            -- Convert 1-indexed array position to 0-indexed buffer line:
-            -- window_start is the 1-indexed buffer line of window line 1,
-            -- hunk.old_start the 1-indexed window line of the first deletion
-            buf_line = (window_start - 1) + (hunk.old_start - 1) + i
-            if buf_line >= 0 and buf_line < total_lines
-                line_text = api.nvim_buf_get_lines(bufnr, buf_line, buf_line + 1, false)[1] or ''
-                -- A zero-width range would be invisible on an empty line
-                opts = if #line_text > 0
-                    { end_row: buf_line, end_col: #line_text, hl_group: 'SweepDeletion', hl_mode: 'combine' }
-                else
-                    { line_hl_group: 'SweepDeletion' }
-                id = api.nvim_buf_set_extmark(bufnr, @ns_id, buf_line, 0, opts)
-                table.insert(@extmark_ids, id)
+        -- 0-indexed buffer row of the hunk's first old line
+        first_row = (window_start - 1) + (hunk.old_start - 1)
+        consumed = 0
+        pending = {}
 
-    -- Show the adds as virtual lines where they would end up: below the
-    -- last deleted line, or for a pure insertion below the old line before
-    -- old_start (above the first line when inserting at the buffer top)
-    render_addition: (hunk, window_start, bufnr) =>
-        total_lines = api.nvim_buf_line_count(bufnr)
-        -- 0-indexed buffer row of the line the adds follow
-        anchor = (window_start - 1) + (hunk.old_start - 1) + #hunk.deletes - 1
+        flush = ->
+            return if #pending == 0
+            @render_virt_lines(bufnr, first_row + consumed - 1, pending, total_lines)
+            pending = {}
+
+        for item in *hunk.items
+            if item.kind == 'add'
+                table.insert(pending, hunk.adds[item.new])
+            else
+                flush()
+                row = first_row + consumed
+                if row >= 0 and row < total_lines
+                    if item.kind == 'pair'
+                        @render_inline(bufnr, row, item.changes)
+                    else
+                        @render_deleted_line(bufnr, row)
+                consumed += 1
+        flush()
+
+    render_deleted_line: (bufnr, row) =>
+        line_text = api.nvim_buf_get_lines(bufnr, row, row + 1, false)[1] or ''
+        -- A zero-width range would be invisible on an empty line
+        opts = if #line_text > 0
+            { end_row: row, end_col: #line_text, hl_group: 'SweepDeletion', hl_mode: 'combine' }
+        else
+            { line_hl_group: 'SweepDeletion' }
+        table.insert(@extmark_ids, api.nvim_buf_set_extmark(bufnr, @ns_id, row, 0, opts))
+
+    -- Highlight the removed part of the line and show the new text inline
+    -- right after it
+    render_inline: (bufnr, row, changes) =>
+        line_len = #(api.nvim_buf_get_lines(bufnr, row, row + 1, false)[1] or '')
+        for change in *changes
+            col = math.min(change.col, line_len)
+            end_col = math.min(change.end_col, line_len)
+            if end_col > col
+                table.insert(@extmark_ids, api.nvim_buf_set_extmark(bufnr, @ns_id, row, col, {
+                    end_col: end_col
+                    hl_group: 'SweepDeletion'
+                    hl_mode: 'combine'
+                }))
+            if #change.text > 0
+                table.insert(@extmark_ids, api.nvim_buf_set_extmark(bufnr, @ns_id, row, end_col, {
+                    virt_text: {{change.text, 'SweepAddition'}}
+                    virt_text_pos: 'inline'
+                    hl_mode: 'combine'
+                }))
+
+    -- anchor: 0-indexed row the lines go below (-1 = above the first line)
+    render_virt_lines: (bufnr, anchor, lines, total_lines) =>
         above = anchor < 0
         anchor = math.max(0, math.min(anchor, total_lines - 1))
 
         virt_lines = {}
-        for _, add_line in ipairs(hunk.adds)
+        for add_line in *lines
             -- Empty strings don't render in virt_lines, use a space instead
             display_line = #add_line > 0 and add_line or ' '
             table.insert(virt_lines, {{display_line, 'SweepAddition'}})
 
-        id = api.nvim_buf_set_extmark(bufnr, @ns_id, anchor, 0, {
+        table.insert(@extmark_ids, api.nvim_buf_set_extmark(bufnr, @ns_id, anchor, 0, {
             virt_lines: virt_lines
             virt_lines_above: above
             hl_mode: 'combine'
-        })
-        table.insert(@extmark_ids, id)
+        }))
 
     -- ---------------------------------------------------------------
     -- Common

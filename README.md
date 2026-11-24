@@ -38,8 +38,9 @@ sweep.nvim: Neovim → Unix socket → llama-server → model
 ## Features
 
 - **FIM completions** — inline ghost text at the cursor in insert mode
-- **Edit predictions** — next-edit suggestions in normal mode, shown as
-  virtual-text diffs. Only changes within `provider.edit_proximity` lines of
+- **Edit predictions** — next-edit suggestions in normal mode. Changes
+  within a line are shown inline (removed text highlighted, new text
+  inserted after it) and new lines as virtual lines. Only changes within `provider.edit_proximity` lines of
   the cursor are shown, and output cut off by the token limit never turns
   into a deletion
 - **Cancellation** — typing, moving to another line, switching mode or
@@ -193,8 +194,8 @@ require("sweep").setup({
 | Group               | Default link  | Purpose                      |
 |---------------------|---------------|------------------------------|
 | `SweepCompletion`   | `Comment`     | FIM ghost text               |
-| `SweepAddition`     | `DiffAdd`     | Added lines in edit preview  |
-| `SweepDeletion`     | `DiffDelete`  | Removed lines in edit preview|
+| `SweepAddition`     | `DiffAdd`     | Added text in edit preview   |
+| `SweepDeletion`     | `DiffDelete`  | Removed text in edit preview |
 
 ## Lualine component
 

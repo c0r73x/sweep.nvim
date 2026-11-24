@@ -69,9 +69,137 @@ group_hunks = (ops) ->
 
     return hunks
 
+-- Lines whose non-blank text matches less than this share are shown as a
+-- whole deleted line plus a new line instead of inline changes
+MIN_INLINE_SCORE = 0.5
+-- Caps on the quadratic work: token LCS cells per line pair, and line
+-- pairs per hunk (bigger hunks only try deleted line i against added line i)
+MAX_TOKEN_CELLS = 40000
+MAX_PAIR_CELLS = 400
+
+-- Split a line into word runs, whitespace runs and single other
+-- characters. Bytes >= 0x80 count as word characters so UTF-8 stays whole.
+tokenize = (s) ->
+    tokens = {}
+    i, n = 1, #s
+    while i <= n
+        _, e = s\find('^[%w_\128-\255]+', i)
+        _, e = s\find('^%s+', i) unless e
+        e = e or i
+        table.insert(tokens, s\sub(i, e))
+        i = e + 1
+    return tokens
+
+nonblank_len = (s) -> #(s\gsub('%s+', ''))
+
+-- How to turn old_line into new_line in place, as a list of
+-- { col, end_col, text } with 0-indexed byte columns into old_line:
+-- old_line[col, end_col) goes away and text appears at end_col.
+-- score is the share of non-blank text the lines have in common (a blank
+-- line on either side scores MIN_INLINE_SCORE: fill or empty it in place).
+-- Returns nil when the lines are too long to compare.
+inline_changes = (old_line, new_line) ->
+    a, b = tokenize(old_line), tokenize(new_line)
+    return nil if #a * #b > MAX_TOKEN_CELLS
+
+    ops = backtrack(compute_lcs(a, b), a, b)
+    changes = {}
+    col, equal_len = 0, 0
+    current = nil
+    for op in *ops
+        if op.type == 'equal'
+            if current
+                table.insert(changes, current)
+                current = nil
+            col += #op.text
+            equal_len += #op.text if op.text\find('%S')
+        else
+            current = current or { col: col, end_col: col, text: '' }
+            if op.type == 'delete'
+                col += #op.text
+                current.end_col = col
+            else
+                current.text ..= op.text
+    table.insert(changes, current) if current
+
+    old_len, new_len = nonblank_len(old_line), nonblank_len(new_line)
+    score = if old_len == 0 and new_len == 0
+        1
+    elseif old_len == 0 or new_len == 0
+        MIN_INLINE_SCORE
+    else
+        2 * equal_len / (old_len + new_len)
+
+    return { changes: changes, score: score }
+
+-- Match a hunk's deleted lines with its added lines so similar lines can be
+-- shown as inline changes. Returns the hunk in display order as items
+-- { kind: 'pair', old: i, new: j, changes }, { kind: 'delete', old: i }
+-- and { kind: 'add', new: j } (indexes into deletes / adds). The pairing
+-- keeps both sides in order and maximises the total score; unpaired adds
+-- come after unpaired deletes at the same spot.
+pair_lines = (deletes, adds) ->
+    m, n = #deletes, #adds
+    inline = {}
+    try_pair = (i, j) ->
+        result = inline_changes(deletes[i], adds[j])
+        inline[i][j] = result if result and result.score >= MIN_INLINE_SCORE
+
+    for i = 1, m
+        inline[i] = {}
+    if m * n <= MAX_PAIR_CELLS
+        for i = 1, m
+            for j = 1, n
+                try_pair(i, j)
+    else
+        for i = 1, math.min(m, n)
+            try_pair(i, i)
+
+    -- best[i][j]: best total score for deletes[1..i] against adds[1..j]
+    best, move = {}, {}
+    for i = 0, m
+        best[i], move[i] = {}, {}
+        for j = 0, n
+            if i == 0 and j == 0
+                best[i][j] = 0
+            elseif i == 0
+                best[i][j], move[i][j] = 0, 'add'
+            elseif j == 0
+                best[i][j], move[i][j] = 0, 'delete'
+            else
+                -- Ties go to 'add' so that, read backwards, adds land last
+                score, step = best[i][j - 1], 'add'
+                if best[i - 1][j] > score
+                    score, step = best[i - 1][j], 'delete'
+                paired = inline[i][j]
+                if paired and best[i - 1][j - 1] + paired.score > score
+                    score, step = best[i - 1][j - 1] + paired.score, 'pair'
+                best[i][j], move[i][j] = score, step
+
+    items = {}
+    i, j = m, n
+    while i > 0 or j > 0
+        step = move[i][j]
+        if step == 'pair'
+            table.insert(items, 1, { kind: 'pair', old: i, new: j, changes: inline[i][j].changes })
+            i -= 1
+            j -= 1
+        elseif step == 'delete'
+            table.insert(items, 1, { kind: 'delete', old: i })
+            i -= 1
+        else
+            table.insert(items, 1, { kind: 'add', new: j })
+            j -= 1
+    return items
+
 -- Main diff function: compare current lines vs updated lines
--- Returns { ops: [...], hunks: [...], has_changes: bool }
+-- Returns { ops: [...], hunks: [...], has_changes: bool }; each hunk has
+-- items from pair_lines for rendering
 export default {
+    :tokenize
+    :inline_changes
+    :pair_lines
+
     diff: (current_lines, updated_lines) ->
         -- Fast path: identical
         if #current_lines == #updated_lines
@@ -86,6 +214,8 @@ export default {
         dp = compute_lcs(current_lines, updated_lines)
         ops = backtrack(dp, current_lines, updated_lines)
         hunks = group_hunks(ops)
+        for hunk in *hunks
+            hunk.items = pair_lines(hunk.deletes, hunk.adds)
 
         return { ops: ops, hunks: hunks, has_changes: #hunks > 0 }
 
