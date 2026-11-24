@@ -79,5 +79,29 @@ eq('edit truncated insert', rti and {#rti, rti[11], rti[12], rti[22]}, {22, 'NEW
 local td = '\n' .. table.concat({'l1','l2','l3','l4','l5','l6','l7','l8','l9','l10','l12','l13','l1'}, '\n')
 local rtd = p.post_process_edit(td, true, cur, 10, 8)
 eq('edit truncated delete', rtd and {#rtd, rtd[11], rtd[20]}, {20, 'l12', 'l21'})
+
+-- Hunks that undo the user's change are dropped
+local function json(v10, v13)
+  local t = {}
+  for i = 1, 18 do t[i] = 'l' .. i end
+  t[10] = '        "baz": "' .. v10 .. '"'
+  t[13] = '        "baz": "' .. v13 .. '",'
+  return t
+end
+local orig, cur = json('2.0.0', '3.0.0'), json('12.0.0', '3.0.0')
+local r = p.post_process_edit(table.concat(json('2.0.0', '1.0.0'), '\n'), false, cur, 9, 8, orig)
+eq('revert of edited line dropped, other hunk kept', r and { r[10], r[13] }, { cur[10], '        "baz": "1.0.0",' })
+r = p.post_process_edit(table.concat(json('2.0.0', '3.0.0'), '\n'), false, cur, 9, 8, orig)
+eq('only a revert: nothing', r, nil)
+r = p.post_process_edit('a\nx = 2,\ny = 3\nb', false, { 'a', 'x = 2', 'b' }, 1, 8, { 'a', 'x = 1', 'b' })
+eq('text added after the typed text is kept', r, { 'a', 'x = 2,', 'y = 3', 'b' })
+r = p.post_process_edit('a\nx = 2\ny = 2\nb', false, { 'a', 'x = 2', 'b' }, 1, 8, { 'a', 'x = 1', 'b' })
+eq('new line after the edited line is kept', r, { 'a', 'x = 2', 'y = 2', 'b' })
+r = p.post_process_edit('a\nb\nc', false, { 'a', 'c' }, 1, 8, { 'a', 'b', 'c' })
+eq('putting back a deleted line dropped', r, nil)
+r = p.post_process_edit('a\nx = 3\nb', false, { 'a', 'x = 2', 'b' }, 1, 8, nil)
+eq('no original: unchanged behaviour', r, { 'a', 'x = 3', 'b' })
+eq('edit spans', p.edit_spans({ 'a', 'b', 'c', 'd' }, { 'a', 'B', 'c' }), { { 2, 2 }, { 3, 4 } })
+
 print(fails == 0 and 'ALL PASS' or (fails .. ' FAILED'))
 os.exit(fails == 0 and 0 or 1)

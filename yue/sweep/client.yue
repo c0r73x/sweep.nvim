@@ -174,7 +174,7 @@ export default class SweepClient
 
             proximity = @config.provider.edit_proximity or 8
             lines = post.post_process_edit(text, truncated, context.current_lines,
-                context.cursor_offset or 0, proximity)
+                context.cursor_offset or 0, proximity, context.original_lines)
             callback(lines, nil)
         )
         @abort = abort
@@ -233,8 +233,14 @@ export default class SweepClient
         current_lines = context.current_lines or {}
 
         -- Recent edits, minus those to this buffer since the original
-        -- snapshot (they are the original -> current change below)
-        diff_sections = tracker and tracker\get_diff_sections(context.bufnr, context.original_tick) or {}
+        -- snapshot (they are the original -> current change below) and
+        -- older drafts of the lines changed now: the model reads those as
+        -- a pattern and suggests going back to them
+        spans = {}
+        offset = (context.window_start or 1) - 1
+        for s in *post.edit_spans(original_lines, current_lines)
+            table.insert(spans, { s[1] + offset, s[2] + offset })
+        diff_sections = tracker and tracker\get_diff_sections(context.bufnr, context.original_tick, spans) or {}
 
         -- Check if there's any edit signal for the model to work with
         has_diff_history = #diff_sections > 0

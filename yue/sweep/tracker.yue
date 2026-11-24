@@ -36,6 +36,12 @@ lines_equal = (a, b) ->
 whitespace_only = (a, b) ->
     table.concat(a, '\n')\gsub('%s+', '') == table.concat(b, '\n')\gsub('%s+', '')
 
+-- Whether a history entry touches any of the 1-indexed { lo, hi } spans
+overlaps = (edit, spans) ->
+    for s in *(spans or {})
+        return true if edit.start_line <= s[2] and edit.end_line >= s[1]
+    false
+
 export default class EditTracker
     config: nil
     max_edits: 6
@@ -273,11 +279,15 @@ export default class EditTracker
     -- Edits to bufnr made after its changedtick since_tick are left out: the
     -- prompt already shows them as original -> current, and the model reads
     -- a change that is also in the history as done, predicting nothing.
-    get_diff_sections: (bufnr, since_tick) =>
+    -- Edits to bufnr touching skip_spans (lines changed since the original)
+    -- are left out too: older drafts of those lines read as a pattern to
+    -- go back to.
+    get_diff_sections: (bufnr, since_tick, skip_spans) =>
         sections = {}
         for _, edit in ipairs(@edit_history)
             continue if since_tick and edit.bufnr == bufnr and
                 edit.tick and edit.tick > since_tick
+            continue if edit.bufnr == bufnr and overlaps(edit, skip_spans)
             parts = {}
             table.insert(parts, "<|file_sep|>#{edit.filepath}.diff")
             table.insert(parts, "original:")

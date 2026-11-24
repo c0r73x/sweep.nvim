@@ -112,5 +112,13 @@ tracker:attach(buf)
 keys('2GSy = 3<Esc>')
 eq('S: line before the change', original(buf), { 'x = 1', 'y = 2' })
 
+
+-- Older drafts of the lines being changed now are left out
+local t2 = EditTracker(config)
+local function entry(b, line, old, new) return { bufnr = b, filepath = 'f', start_line = line, end_line = line, old_lines = { old }, new_lines = { new } } end
+t2.edit_history = { entry(buf, 10, 'bab', 'baz'), entry(buf, 10, '3', '2'), entry(buf, 20, 'a', 'b'), entry(buf + 1, 10, 'x', 'y') }
+eq('drafts of edited lines skipped', #t2:get_diff_sections(buf, nil, { { 10, 10 } }), 2)
+eq('no spans keeps all', #t2:get_diff_sections(buf, nil, nil), 4)
+
 print(fails == 0 and 'ALL PASS' or (fails .. ' FAILED'))
 os.exit(fails == 0 and 0 or 1)
