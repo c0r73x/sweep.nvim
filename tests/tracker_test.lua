@@ -58,5 +58,59 @@ bs:update_state(buf)
 ctx = bs:get_context(buf, 'edit')
 eq('fresh snapshot keeps all', #tracker:get_diff_sections(ctx.bufnr, ctx.original_tick), 4)
 
+-- c, s and o change the text before Insert mode starts: the original is
+-- the text before that change when the typed text continues it (one undo
+-- step), not the text Insert mode started with
+local group = api.nvim_create_augroup('tracker_test', { clear = true })
+api.nvim_create_autocmd('InsertEnter', { group = group, callback = function()
+    local b = api.nvim_get_current_buf()
+    bs:snapshot_original(b, tracker:step_before(b))
+end })
+api.nvim_create_autocmd('InsertLeave', { group = group, callback = function()
+    bs:settle_original(api.nvim_get_current_buf())
+end })
+local function keys(k)
+    api.nvim_feedkeys(api.nvim_replace_termcodes(k, true, false, true), 'xt', false)
+end
+local function original(b)
+    bs:update_state(b)
+    local c = bs:get_context(b, 'edit')
+    return c.original_lines, c
+end
+
+buf = new_buf({ "console.log('a');", "console.log('b');" })
+tracker:attach(buf)
+api.nvim_win_set_cursor(0, { 1, 9 })
+keys('ciwwarn<Esc>')
+local orig
+orig, ctx = original(buf)
+eq('ciw: word before the change', orig[1], "console.log('a');")
+eq('ciw: edit not repeated as history', #tracker:get_diff_sections(buf, ctx.original_tick), 4)
+
+-- Entering Insert mode again without a change keeps the typed text
+keys('A<Esc>')
+eq('A after ciw: typed text stays', original(buf)[1], "console.warn('a');")
+
+buf = new_buf({ 'a', 'b' })
+tracker:attach(buf)
+keys('1Goc<Esc>')
+eq('o: without the opened line', original(buf), { 'a', 'b' })
+
+buf = new_buf({ 'a', 'b', 'c' })
+tracker:attach(buf)
+keys('2Gdd')
+keys('ix<Esc>')
+eq('dd then i: dd is not part of the insert', original(buf), { 'a', 'c' })
+
+buf = new_buf({ 'one two' })
+tracker:attach(buf)
+keys('1G0cw<Esc>')
+eq('cw without typing: the deleted word', original(buf), { 'one two' })
+
+buf = new_buf({ 'x = 1', 'y = 2' })
+tracker:attach(buf)
+keys('2GSy = 3<Esc>')
+eq('S: line before the change', original(buf), { 'x = 1', 'y = 2' })
+
 print(fails == 0 and 'ALL PASS' or (fails .. ' FAILED'))
 os.exit(fails == 0 and 0 or 1)

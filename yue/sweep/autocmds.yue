@@ -83,8 +83,9 @@ insert_enter_callback = () ->
     ct\reject()
     ct\cancel_request()
     stop_timer(ct)
-    -- Snapshot original state for sweep prompt (original vs current)
-    ct.buffer_state\snapshot_original(bufnr)
+    -- Snapshot original state for sweep prompt (original vs current), and
+    -- the text before c/s/o changed it
+    ct.buffer_state\snapshot_original(bufnr, ct.tracker\step_before(bufnr))
 
 insert_leave_callback = () ->
     ct = _G.sweep
@@ -94,6 +95,7 @@ insert_leave_callback = () ->
     ct\reject()
     ct\cancel_request()
     stop_timer(ct)
+    ct.buffer_state\settle_original(api.nvim_get_current_buf())
 
 mode_changed_callback = () ->
     ct = _G.sweep

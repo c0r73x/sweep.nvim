@@ -45,6 +45,8 @@ export default class EditTracker
     -- Per-buffer data
     attached_bufs: {}       -- bufnr -> true (already attached)
     line_snapshots: {}      -- bufnr -> {lines} (last-known line content for diff)
+    -- bufnr -> the latest undo step made outside Insert mode (see step_before)
+    last_steps: {}
     -- Global edit history (across buffers, most recent last)
     edit_history: {}
     -- Recently visited buffers (ordered, most recent last)
@@ -65,6 +67,7 @@ export default class EditTracker
             @ignore_ft[ft] = true
         @attached_bufs = {}
         @line_snapshots = {}
+        @last_steps = {}
         @edit_history = {}
         @recent_files = {}
         @stopped = false
@@ -97,12 +100,14 @@ export default class EditTracker
                 return true if self.stopped
                 if self.line_snapshots[buf]
                     self.line_snapshots[buf] = api.nvim_buf_get_lines(buf, 0, -1, false)
+                self.last_steps[buf] = nil
                 return
 
             on_detach: (_, buf) ->
                 return if self.stopped
                 self.attached_bufs[buf] = nil
                 self.line_snapshots[buf] = nil
+                self.last_steps[buf] = nil
         })
 
         @attached_bufs[bufnr] = true
@@ -112,6 +117,7 @@ export default class EditTracker
         @stopped = true
         @attached_bufs = {}
         @line_snapshots = {}
+        @last_steps = {}
 
     -- Called by nvim_buf_attach when lines change
     -- first_line, last_line: 0-indexed range of OLD lines that were replaced
@@ -130,6 +136,7 @@ export default class EditTracker
         -- even for changes that aren't recorded below
         new_lines = api.nvim_buf_get_lines(bufnr, first_line, new_last_line, false)
         splice(snapshot, first_line, last_line, new_lines)
+        @record_step(bufnr, first_line, old_lines, #new_lines, tick)
 
         -- Skip trivial changes (identical content) and big ones
         return if lines_equal(old_lines, new_lines)
@@ -184,6 +191,42 @@ export default class EditTracker
         while #@edit_history > @max_edits
             table.remove(@edit_history, 1)
 
+    -- c, s, C, S, o and O change the text before Insert mode starts, so
+    -- the snapshot taken at InsertEnter already lacks the replaced word or
+    -- has the opened line. Changes made outside Insert mode are kept per
+    -- undo step (changenr()); the typed text joins that step when the
+    -- insert continues the change.
+    record_step: (bufnr, first_line, old_lines, count, tick) =>
+        if api.nvim_get_mode().mode\match('^[iR]')
+            -- Typed text: keeps the step, but it can no longer be reverted
+            step = @last_steps[bufnr]
+            step.last_tick = nil if step
+            return
+        unless bufnr == api.nvim_get_current_buf()
+            @last_steps[bufnr] = nil
+            return
+        seq = vim.fn.changenr()
+        step = @last_steps[bufnr]
+        unless step and step.seq == seq
+            -- tick: the changedtick before the step
+            step = { seq: seq, tick: tick - 1, changes: {} }
+            @last_steps[bufnr] = step
+        table.insert(step.changes, { first: first_line, old_lines: old_lines, count: count })
+        step.last_tick = tick
+
+    -- The text before the latest undo step made outside Insert mode, when
+    -- that step is the last change to the buffer: { seq, tick, lines },
+    -- seq being its undo number and tick the changedtick before it.
+    -- Otherwise nil.
+    step_before: (bufnr) =>
+        step = @last_steps[bufnr]
+        return nil unless step and step.last_tick == api.nvim_buf_get_changedtick(bufnr)
+        lines = api.nvim_buf_get_lines(bufnr, 0, -1, false)
+        for i = #step.changes, 1, -1
+            c = step.changes[i]
+            splice(lines, c.first, c.first + c.count, c.old_lines)
+        { seq: step.seq, tick: step.tick, lines: lines }
+
     -- Track buffer visit for recent files context
     track_visit: (bufnr) =>
         bufnr = bufnr or api.nvim_get_current_buf()
@@ -221,6 +264,7 @@ export default class EditTracker
 
     -- Buffer wiped out: drop it from the recent files
     forget: (bufnr) =>
+        @last_steps[bufnr] = nil
         for i = #@recent_files, 1, -1
             table.remove(@recent_files, i) if @recent_files[i].bufnr == bufnr
 
@@ -285,5 +329,6 @@ export default class EditTracker
     clear: () =>
         @attached_bufs = {}
         @line_snapshots = {}
+        @last_steps = {}
         @edit_history = {}
         @recent_files = {}

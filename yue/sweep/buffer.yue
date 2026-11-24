@@ -122,17 +122,36 @@ export default class BufferState
     -- Snapshot the full buffer as "original" (call on InsertEnter)
     -- We store all lines so we can later extract any window range,
     -- keeping original_lines aligned with current_lines regardless of cursor movement.
-    snapshot_original: (bufnr) =>
+    -- before ({ seq, tick, lines } from EditTracker.step_before): the text
+    -- before the change that started Insert mode (c, s, o, ...). It
+    -- becomes the original if the insert continues that change, see
+    -- settle_original.
+    snapshot_original: (bufnr, before) =>
         bufnr = bufnr or api.nvim_get_current_buf()
         return unless @is_valid_buffer(bufnr)
 
         state = @buffer_states[bufnr] or {}
         state.original_all_lines = api.nvim_buf_get_lines(bufnr, 0, -1, false)
         state.original_tick = api.nvim_buf_get_changedtick(bufnr)
+        state.pending_original = before
         state.bufnr = bufnr
         state.filepath = api.nvim_buf_get_name(bufnr)
         state.filetype = vim.bo[bufnr].filetype
         @buffer_states[bufnr] = state
+
+    -- Decide on the pending original of snapshot_original. Text typed in
+    -- Insert mode joins the undo step of the change that started it (ciw,
+    -- o), but not of an earlier command (dd, then i). Call on InsertLeave:
+    -- later changes would make the undo number differ.
+    settle_original: (bufnr) =>
+        state = @buffer_states[bufnr]
+        pending = state and state.pending_original
+        return unless pending
+        state.pending_original = nil
+        return unless bufnr == api.nvim_get_current_buf()
+        if vim.fn.changenr() == pending.seq
+            state.original_all_lines = pending.lines
+            state.original_tick = pending.tick
 
     -- Update the current state (call on TextChangedI)
     update_state: (bufnr) =>
@@ -171,6 +190,7 @@ export default class BufferState
         state = @buffer_states[bufnr]
         return nil unless state
         return nil unless state.current_window
+        @settle_original(bufnr)
 
         current = state.current_window
 
