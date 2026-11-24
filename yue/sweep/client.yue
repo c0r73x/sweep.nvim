@@ -84,6 +84,9 @@ export default class SweepClient
         else
             prompt = @build_edit_prompt(context, tracker)
             stop = EDIT_STOP
+            -- Earlier versions of lines in this buffer's history: a hunk
+            -- turning a line back into one of them is dropped
+            context.line_versions = tracker and tracker\line_versions(context.bufnr)
             -- The output repeats the whole window: never cut it short
             -- (~3 chars per token, plus room for added lines)
             window_chars = #table.concat(context.current_lines or {}, '\n')
@@ -173,9 +176,8 @@ export default class SweepClient
                 return callback(#result > 0 and result or nil, nil)
 
             proximity = @config.provider.edit_proximity or 8
-            versions = tracker and tracker\line_versions(context.bufnr)
             lines = post.post_process_edit(text, truncated, context.current_lines,
-                context.cursor_offset or 0, proximity, context.original_lines, versions)
+                context.cursor_offset or 0, proximity, context.original_lines, context.line_versions)
             callback(lines, nil)
         )
         @abort = abort
