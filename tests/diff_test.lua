@@ -132,5 +132,44 @@ check('render json', marks, {
 })
 ui:hide()
 
+-- Replacements are drawn over the old text: what the screen shows is the
+-- new line (old text left over is marked as deleted, extra new text is
+-- inline)
+local function render_line(old, new)
+    api.nvim_buf_set_lines(buf, 0, -1, false, { '{', old, '}' })
+    ui:show_edit({ '{', new, '}' }, { bufnr = buf, window_start = 1, current_lines = { '{', old, '}' }, line_num = 2, cursor_col = 0 })
+    local out = {}
+    for _, m in ipairs(api.nvim_buf_get_extmarks(buf, ui.ns_id, 0, -1, { details = true })) do
+        local d = m[4]
+        local kind = d.virt_text_pos or (d.virt_lines and 'lines') or (d.hl_group and 'del') or 'line_hl'
+        local what = d.virt_text and d.virt_text[1][1] or d.virt_lines and d.virt_lines[1][1][1] or d.end_col
+        table.insert(out, ('%s@%d:%s'):format(kind, m[3], what))
+    end
+    table.sort(out)
+    vim.cmd('redraw')
+    local screen = {}
+    for c = 1, 40 do screen[c] = vim.fn.screenstring(2, c) end
+    ui:hide()
+    return out, table.concat(screen):gsub('%s+$', '')
+end
+local base = '        "baz": '
+local cases = {
+    { 'replace same width', base .. '"1.0.0"', base .. '"3.0.0"', { 'overlay@16:3' } },
+    { 'replace shorter', base .. '"10.0.0"', base .. '"3.0.0"', { 'overlay@16:3' } },
+    { 'replace longer', base .. '"1.0.0"', base .. '"12.0.0"', { 'inline@17:2', 'overlay@16:1' } },
+    { 'shorter then insert', 'f(10, a)', 'f(3, a, b)', { 'inline@8:b', 'overlay@2:3' } },
+    { 'insert then shorter', 'g(a, 10)', 'g(a, b, 3)', { 'inline@7: 3', 'overlay@5:b,' } },
+    { 'wide characters', 'local title = "日本" -- heading', 'local title = "日" -- heading', { 'overlay@15:日' } },
+    { 'tab before the change', '\tx = 10', '\tx = 2', { 'overlay@5:2' } },
+}
+for _, c in ipairs(cases) do
+    local m, scr = render_line(c[2], c[3])
+    if c[4] then check(c[1] .. ' marks', m, c[4]) end
+    check(c[1] .. ' screen', scr, (c[3]:gsub('\t', string.rep(' ', vim.o.tabstop))))
+end
+-- A tab in the changed text has no fixed width: the old text is marked
+-- and the new one inline
+check('tab in change marks', render_line('a\t= 1', 'a = 1'), { 'del@1:2', 'inline@2: ' })
+
 print(failed == 0 and 'diff tests: OK' or ('diff tests: %d failed'):format(failed))
 vim.cmd(failed == 0 and 'qa!' or 'cq!')

@@ -4,6 +4,20 @@
 api = vim.api
 Diff = require('sweep.diff')
 
+-- Split s after `cells` display cells. A character crossing the boundary
+-- goes to the head with round_up, else to the tail. Returns head, tail
+-- and the head's width.
+split_cells = (s, cells, round_up) ->
+    width, i = 0, 1
+    while i <= #s
+        break if round_up and width >= cells
+        n = vim.str_utf_end(s, i) + 1
+        w = vim.fn.strdisplaywidth(s\sub(i, i + n - 1))
+        break if not round_up and width + w > cells
+        width += w
+        i += n
+    s\sub(1, i - 1), s\sub(i), width
+
 export default class GhostText
     config: nil
     ns_id: nil
@@ -161,26 +175,85 @@ export default class GhostText
             { line_hl_group: 'SweepDeletion' }
         table.insert(@extmark_ids, api.nvim_buf_set_extmark(bufnr, @ns_id, row, 0, opts))
 
-    -- Highlight the removed part of the line and show the new text inline
-    -- right after it
+    -- Changes within a line: replaced text is drawn over the old text
+    -- (what doesn't fit goes inline after it, old text left over is
+    -- marked as deleted), removed text is marked as deleted and added
+    -- text is shown inline
     render_inline: (bufnr, row, changes) =>
-        line_len = #(api.nvim_buf_get_lines(bufnr, row, row + 1, false)[1] or '')
-        for change in *changes
-            col = math.min(change.col, line_len)
-            end_col = math.min(change.end_col, line_len)
+        line = api.nvim_buf_get_lines(bufnr, row, row + 1, false)[1] or ''
+        for idx, change in ipairs(changes)
+            col = math.min(change.col, #line)
+            end_col = math.min(change.end_col, #line)
+            old = line\sub(col + 1, end_col)
+            new = change.text
+            inline = new
+            -- Tabs have no fixed width, so they are not overlaid
+            if #old > 0 and #new > 0 and not (old .. new)\find('\t')
+                old_w = vim.fn.strdisplaywidth(old)
+                -- Shorter: the old text left over would read as part of
+                -- the new one, so the rest of the line is redrawn
+                if vim.fn.strdisplaywidth(new) < old_w and @render_rest(bufnr, row, line, changes, idx)
+                    return
+                head, tail, head_w = split_cells(new, old_w)
+                under, _, under_w = split_cells(old, head_w, true)
+                if #under > 0
+                    @add_mark(bufnr, row, col, {
+                        virt_text: {{head .. string.rep(' ', under_w - head_w), 'SweepAddition'}}
+                        virt_text_pos: 'overlay'
+                    })
+                    col += #under
+                    inline = tail
             if end_col > col
-                table.insert(@extmark_ids, api.nvim_buf_set_extmark(bufnr, @ns_id, row, col, {
+                @add_mark(bufnr, row, col, {
                     end_col: end_col
                     hl_group: 'SweepDeletion'
                     hl_mode: 'combine'
-                }))
-            if #change.text > 0
-                table.insert(@extmark_ids, api.nvim_buf_set_extmark(bufnr, @ns_id, row, end_col, {
+                })
+            if #inline > 0
+                @add_mark(bufnr, row, end_col, {
                     -- Not 'combine': that mixes in the syntax colour of
                     -- the text it is attached to
-                    virt_text: {{change.text, 'SweepAddition'}}
+                    virt_text: {{inline, 'SweepAddition'}}
                     virt_text_pos: 'inline'
-                }))
+                })
+
+    -- Draw the line from changes[first] on as it will be: one overlay
+    -- over the old text (padded with spaces when shorter), anything
+    -- wider than the old text inline at the end of the line. Unchanged
+    -- text loses its syntax colours. false when tabs prevent it.
+    render_rest: (bufnr, row, line, changes, first) =>
+        start = math.min(changes[first].col, #line)
+        chunks = {}
+        pos = start
+        for k = first, #changes
+            c = changes[k]
+            col = math.min(c.col, #line)
+            table.insert(chunks, {line\sub(pos + 1, col)}) if col > pos
+            table.insert(chunks, {c.text, 'SweepAddition'}) if #c.text > 0
+            pos = math.max(pos, math.min(c.end_col, #line))
+        table.insert(chunks, {line\sub(pos + 1)}) if pos < #line
+        old_rest = line\sub(start + 1)
+        return false if old_rest\find('\t')
+        for chunk in *chunks
+            return false if chunk[1]\find('\t')
+
+        room = vim.fn.strdisplaywidth(old_rest)
+        over, after = {}, {}
+        for chunk in *chunks
+            if #after > 0
+                table.insert(after, chunk)
+                continue
+            head, tail, head_w = split_cells(chunk[1], room)
+            table.insert(over, {head, chunk[2]}) if #head > 0
+            room -= head_w
+            table.insert(after, {tail, chunk[2]}) if #tail > 0
+        table.insert(over, {string.rep(' ', room)}) if room > 0
+        @add_mark(bufnr, row, start, { virt_text: over, virt_text_pos: 'overlay' })
+        @add_mark(bufnr, row, #line, { virt_text: after, virt_text_pos: 'inline' }) if #after > 0
+        true
+
+    add_mark: (bufnr, row, col, opts) =>
+        table.insert(@extmark_ids, api.nvim_buf_set_extmark(bufnr, @ns_id, row, col, opts))
 
     -- anchor: 0-indexed row the lines go below (-1 = above the first line)
     render_virt_lines: (bufnr, anchor, lines, total_lines) =>

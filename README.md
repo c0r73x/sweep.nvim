@@ -44,8 +44,9 @@ sweep.nvim: Neovim → Unix socket → llama-server → model
   block it continues the body until it dedents. `provider.max_fim_lines` is
   only a safety cap
 - **Edit predictions** — next-edit suggestions in normal mode. Changes
-  within a line are shown inline (removed text highlighted, new text
-  inserted after it) and new lines as virtual lines. Only changes within `provider.edit_proximity` lines of
+  within a line are shown in place (replaced text is drawn over the old
+  text, removed text is highlighted, added text is inserted) and new lines
+  as virtual lines. Only changes within `provider.edit_proximity` lines of
   the cursor are shown, and output cut off by the token limit never turns
   into a deletion
 - **Cancellation** — typing, moving to another line, switching mode or
