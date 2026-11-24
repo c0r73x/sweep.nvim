@@ -31,13 +31,18 @@ sweep.nvim: Neovim → Unix socket → llama-server → model
   prompt takes ~0.65 s instead of ~2.7 s, with identical output.
 - **Two slots** — FIM and edit prompts each keep their KV cache, so switching
   between insert and normal mode does not re-read the prompt.
-- **Streaming** — FIM output stops as soon as it has enough lines, and a
+- **Streaming** — FIM output stops as soon as the line or block is done, and a
   superseded request is aborted on the server right away.
 - **No extra runtime** — no Python, Go or Node: just `llama-server`.
 
 ## Features
 
-- **FIM completions** — inline ghost text at the cursor in insert mode
+- **FIM completions** — inline ghost text at the cursor in insert mode.
+  The completion ends where the code does: mid-line it completes the rest of
+  the line; on a line that opens a block it adds the block (deeper lines,
+  `else`/`catch`, the closing `end`/`}`); on an empty line at the end of a
+  block it continues the body until it dedents. `provider.max_fim_lines` is
+  only a safety cap
 - **Edit predictions** — next-edit suggestions in normal mode. Changes
   within a line are shown inline (removed text highlighted, new text
   inserted after it) and new lines as virtual lines. Only changes within `provider.edit_proximity` lines of
@@ -147,7 +152,7 @@ require("sweep").setup({
         mode               = "auto",   -- "auto" | "fim" | "edit"
         max_tokens         = 512,      -- min edit budget (grows with the window)
         fim_max_tokens     = 128,
-        max_fim_lines      = 4,
+        max_fim_lines      = 8,        -- safety cap, see FIM completions
         edit_proximity     = 8,        -- keep edits within this many lines of the cursor
         temperature        = 0.0,
         top_p              = 1.0,

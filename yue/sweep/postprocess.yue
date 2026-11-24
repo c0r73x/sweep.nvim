@@ -8,42 +8,88 @@ strip_special = (text) ->
 
 trim = (s) -> s\match('^%s*(.-)%s*$')
 
--- First non-blank line after the cursor, trimmed
-next_suffix_line = (suffix_lines) ->
-    for line in *(suffix_lines or {})
-        t = trim(line)
-        return t if t ~= ''
-    nil
+indent = (line) -> #line\match('^%s*')
 
--- Should a FIM stream stop now? True once it has max_lines lines (the
--- rest would be cut anyway) or a finished line repeats the line that
--- follows the cursor (the model is rewriting existing code).
-fim_should_stop = (text, max_lines, next_line) ->
-    lines = vim.split(text, '\n', { plain: true })
-    return true if #lines > max_lines
-    if next_line
-        -- Only finished lines: the last one may still grow
-        for i = 2, #lines - 1
-            return true if trim(lines[i]) == next_line
+-- Lines at the cursor's indent that continue the block it opens, or
+-- close it (kept, then the completion ends)
+CONTINUERS = {'^else%f[^%w_]', '^elif%f[^%w_]', '^elseif%f[^%w_]', '^except%f[^%w_]', '^catch%f[^%w_]',
+    '^finally%f[^%w_]', '^}%s*else%f[^%w_]', '^}%s*catch%f[^%w_]'}
+CLOSERS = {'^[%}%)%]]', '^end%f[^%w_]'}
+
+matches = (s, patterns) ->
+    for pat in *patterns
+        return true if s\find(pat)
     false
+
+-- Where a FIM completion may end, from the text around the cursor.
+-- before/after: the cursor line split at the cursor; below: the lines
+-- that follow it. Kinds:
+--   line:  text after the cursor (or the block below already has its
+--          body): complete this line only
+--   body:  empty line at the end of a block: lines while they stay at
+--          the cursor's indent or deeper
+--   block: this line plus the block it opens (deeper lines, else/catch
+--          continuations and one closing line at the cursor's indent)
+-- max_lines caps all kinds.
+fim_scope = (before, after, below, max_lines=8) ->
+    base = indent(before)
+    nxt = nil
+    for l in *(below or {})
+        if l\find('%S')
+            nxt = l
+            break
+    kind = if after\find('%S') or (nxt and indent(nxt) > base)
+        'line'
+    elseif not before\find('%S') and (not nxt or indent(nxt) < base)
+        'body'
+    else
+        'block'
+    { :kind, :base, :max_lines }
+
+-- Lines of a FIM completion to keep, and whether its end was found.
+-- Only lines 2..n_complete are judged (a streamed last line may grow).
+fim_cut = (lines, scope, n_complete=#lines) ->
+    keep = math.min(1, #lines)
+    for i = 2, n_complete
+        return keep, true if scope.kind == 'line' or keep >= scope.max_lines
+        line = lines[i]
+        s = trim(line)
+        if s == ''
+            keep = i
+            continue
+        ind = indent(line)
+        return keep, true if ind < scope.base
+        if ind == scope.base and scope.kind == 'block'
+            if matches(s, CONTINUERS)
+                keep = i
+                continue
+            keep = i if matches(s, CLOSERS)
+            return keep, true
+        keep = i
+    keep, false
+
+DEFAULT_SCOPE = { kind: 'block', base: 0, max_lines: 8 }
+
+-- Should a FIM stream stop now? Once a finished line ends the
+-- completion, a new line dedents past the cursor, or the cap is hit.
+fim_should_stop = (text, scope=DEFAULT_SCOPE) ->
+    lines = vim.split(text, '\n', { plain: true })
+    return true if #lines > (scope.kind == 'line' and 1 or scope.max_lines)
+    _, done = fim_cut(lines, scope, #lines - 1)
+    return true if done
+    last = lines[#lines]
+    #lines > 1 and last\find('%S') ~= nil and indent(last) < scope.base
 
 -- FIM text is inserted verbatim at the cursor, so leading whitespace is
 -- kept. truncated: generation was cut (token limit or early stop), so the
 -- last line may be partial.
-post_process_fim = (text, truncated, suffix_lines, max_lines=4) ->
+post_process_fim = (text, truncated, scope=DEFAULT_SCOPE) ->
     return '' unless text and text ~= ''
     text = strip_special(text)
     lines = vim.split(text, '\n', { plain: true })
     table.remove(lines) if truncated and #lines > 1
-    while #lines > max_lines
-        table.remove(lines)
-    next_line = next_suffix_line(suffix_lines)
-    if next_line
-        for i = 2, #lines
-            if trim(lines[i]) == next_line
-                lines = [l for l in *lines[1, i - 1]]
-                break
-    (table.concat(lines, '\n')\gsub('%s+$', ''))
+    keep = fim_cut(lines, scope)
+    (table.concat([l for l in *lines[1, keep]], '\n')\gsub('%s+$', ''))
 
 -- Hunks between two line lists: { start_a, count_a, start_b, count_b }
 -- (a count of 0 means an insertion/deletion after line start)
@@ -120,7 +166,7 @@ post_process_edit = (text, truncated, current_lines, cursor_offset=0, proximity=
 
 export default {
     :strip_special
-    :next_suffix_line
+    :fim_scope
     :fim_should_stop
     :post_process_fim
     :post_process_edit

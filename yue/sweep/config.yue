@@ -37,7 +37,7 @@ export default class Config
             -- Model generation parameters
             max_tokens: 512             -- Min token budget for edits (grows with the window)
             fim_max_tokens: 128         -- Max tokens for FIM (inline) completions
-            max_fim_lines: 4            -- Max lines for FIM output
+            max_fim_lines: 8            -- Safety cap; FIM ends at the line/block end
             edit_proximity: 8           -- Keep edit hunks within this many lines of the cursor
             temperature: 0.0            -- Greedy
             top_p: 1.0                  -- Nucleus sampling (1.0 = disabled)

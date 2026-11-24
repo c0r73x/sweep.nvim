@@ -113,8 +113,7 @@ export default class SweepClient
 
     _send: (mode, body, timeout, context, callback, may_start) =>
         generation = @generation
-        max_lines = @config.provider.max_fim_lines or 4
-        next_line = mode == 'fim' and post.next_suffix_line(@get_suffix_lines(context)) or nil
+        scope = mode == 'fim' and @fim_scope(context) or nil
 
         parts = {}
         final = nil         -- last event (has stop_type and timings)
@@ -127,7 +126,7 @@ export default class SweepClient
             if obj.stop
                 final = obj
                 return true
-            if mode == 'fim' and post.fim_should_stop(table.concat(parts), max_lines, next_line)
+            if mode == 'fim' and post.fim_should_stop(table.concat(parts), scope)
                 early = true
                 return true
             false
@@ -170,7 +169,7 @@ export default class SweepClient
                     t.draft_n_accepted or '-', t.draft_n or '-', truncated and ' (truncated)' or ''))
 
             if mode == 'fim'
-                result = post.post_process_fim(text, truncated, @get_suffix_lines(context), max_lines)
+                result = post.post_process_fim(text, truncated, scope)
                 return callback(#result > 0 and result or nil, nil)
 
             proximity = @config.provider.edit_proximity or 8
@@ -209,16 +208,14 @@ export default class SweepClient
 
         "<|fim_prefix|>#{prefix}<|fim_suffix|>#{suffix}<|fim_middle|>"
 
-    -- Get the suffix lines (lines after cursor in the window) for overlap detection
-    get_suffix_lines: (context) =>
+    -- Where FIM output may end (postprocess.fim_scope): from the cursor
+    -- line and the window lines below it
+    fim_scope: (context) =>
         current_lines = context.current_lines or {}
-        cursor_offset = context.cursor_offset or 0
-        after_cursor = string.sub(context.line_content or '', (context.cursor_col or 0) + 1)
-        result = {}
-        table.insert(result, after_cursor) if #after_cursor > 0
-        for i = cursor_offset + 2, #current_lines
-            table.insert(result, current_lines[i])
-        return result
+        line = context.line_content or ''
+        col = context.cursor_col or 0
+        below = [l for l in *current_lines[(context.cursor_offset or 0) + 2, #current_lines]]
+        post.fim_scope(line\sub(1, col), line\sub(col + 1), below, @config.provider.max_fim_lines or 8)
 
     -- ---------------------------------------------------------------
     -- Edit Prompt: next-edit prediction with diff context
