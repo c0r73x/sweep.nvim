@@ -174,6 +174,7 @@ require("sweep").setup({
     context = {
         window_radius      = 10,   -- lines above/below cursor (21 total)
         max_edit_history   = 6,    -- recent edit hunks in prompt
+        restore_history    = true, -- seed a file's history from its undofile and git diff
         max_context_files  = 3,    -- recently visited files for context
         context_file_lines = 60,   -- max lines per context file
     },

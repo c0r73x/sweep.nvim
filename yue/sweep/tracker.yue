@@ -42,6 +42,116 @@ overlaps = (edit, spans) ->
         return true if edit.start_line <= s[2] and edit.end_line >= s[1]
     false
 
+-- Path shown in the prompt: relative to cwd when inside it
+rel_path = (bufnr) ->
+    filepath = api.nvim_buf_get_name(bufnr)
+    return "buffer_#{bufnr}" if #filepath == 0
+    cwd = vim.fn.getcwd()
+    if filepath\sub(1, #cwd) == cwd
+        filepath = filepath\sub(#cwd + 2)
+    filepath
+
+-- Undo steps walked back at most when restoring the history
+MAX_UNDO_STEPS = 50
+
+-- Changes of the latest undo steps in the file's undofile, newest first,
+-- as { start_line, old_lines, new_lines }. Read in a scratch buffer, so the
+-- buffer's own undo state is untouched. {} without an undofile, or when it
+-- belongs to other text (rundo then loads nothing).
+undo_hunks = (bufnr, limit) ->
+    path = api.nvim_buf_get_name(bufnr)
+    return {} if #path == 0
+    file = vim.fn.undofile(path)
+    return {} if #file == 0 or vim.fn.filereadable(file) == 0
+    lines = api.nvim_buf_get_lines(bufnr, 0, -1, false)
+    hunks = {}
+    ei = vim.o.eventignore
+    vim.o.eventignore = 'all'
+    scratch = api.nvim_create_buf(false, true)
+    pcall(api.nvim_buf_call, scratch, ->
+        -- Filling the buffer must not be an undo step of its own
+        vim.bo.undolevels = -1
+        api.nvim_buf_set_lines(scratch, 0, -1, false, lines)
+        vim.bo.undolevels = math.max(vim.go.undolevels, MAX_UNDO_STEPS)
+        vim.cmd('silent! rundo ' .. vim.fn.fnameescape(file))
+        steps = 0
+        while #hunks < limit * 3 and steps < MAX_UNDO_STEPS and vim.fn.undotree().seq_cur > 0
+            newer = api.nvim_buf_get_lines(scratch, 0, -1, false)
+            vim.cmd('silent! undo')
+            older = api.nvim_buf_get_lines(scratch, 0, -1, false)
+            steps += 1
+            d = vim.diff(table.concat(older, '\n') .. '\n', table.concat(newer, '\n') .. '\n',
+                { result_type: 'indices' })
+            for h in *d
+                table.insert(hunks, {
+                    start_line: math.max(1, h[3])
+                    old_lines: [older[i] for i = h[1], h[1] + h[2] - 1]
+                    new_lines: [newer[i] for i = h[3], h[3] + h[4] - 1]
+                })
+    )
+    pcall(api.nvim_buf_delete, scratch, { force: true })
+    vim.o.eventignore = ei
+    hunks
+
+-- Uncommitted changes of the file (git diff against HEAD) as hunks like
+-- undo_hunks, passed to callback on the main loop. Nothing is passed
+-- outside a git work tree or without git.
+git_hunks = (path, callback) ->
+    cmd = { 'git', '-C', vim.fs.dirname(path), 'diff', '--no-color', '--no-ext-diff',
+        '-U0', 'HEAD', '--', path }
+    pcall(vim.system, cmd, { text: true }, (res) ->
+        return unless res.code == 0
+        hunks = {}
+        local cur
+        for line in *vim.split(res.stdout or '', '\n', { plain: true })
+            c = line\match('^@@ %-%d+,?%d* %+(%d+),?%d* @@')
+            if c
+                cur = { start_line: math.max(1, tonumber(c)), old_lines: {}, new_lines: {} }
+                table.insert(hunks, cur)
+            elseif cur
+                mark = line\sub(1, 1)
+                table.insert(cur.old_lines, line\sub(2)) if mark == '-'
+                table.insert(cur.new_lines, line\sub(2)) if mark == '+'
+        vim.schedule(-> callback(hunks))
+    )
+
+-- History entry for a restored hunk; nil for changes the session would
+-- not record either (no change, too big, whitespace only)
+restored_entry = (bufnr, filepath, h) ->
+    return nil if lines_equal(h.old_lines, h.new_lines)
+    return nil if #h.old_lines > MAX_EDIT_LINES or #h.new_lines > MAX_EDIT_LINES
+    return nil if whitespace_only(h.old_lines, h.new_lines)
+    {
+        bufnr: bufnr
+        filepath: filepath
+        start_line: h.start_line
+        end_line: h.start_line + math.max(#h.old_lines, #h.new_lines, 1) - 1
+        old_lines: h.old_lines
+        new_lines: h.new_lines
+        timestamp: 0
+        -- Older than any original snapshot of this session
+        tick: 0
+    }
+
+-- Trimmed non-blank lines of hunks, as a set
+line_set = (hunks, key) ->
+    set = {}
+    for h in *hunks
+        for l in *h[key]
+            l = l\match('^%s*(.-)%s*$')
+            set[l] = true if #l > 0
+    set
+
+covered_by = (h, old_set, new_set) ->
+    any = false
+    for pair in *{ { h.old_lines, old_set }, { h.new_lines, new_set } }
+        for l in *pair[1]
+            l = l\match('^%s*(.-)%s*$')
+            continue if #l == 0
+            any = true
+            return false unless pair[2][l]
+    any
+
 export default class EditTracker
     config: nil
     max_edits: 6
@@ -77,6 +187,7 @@ export default class EditTracker
         @edit_history = {}
         @recent_files = {}
         @stopped = false
+        @restore = ctx.restore_history ~= false
 
     -- Attach to a buffer to track changes
     attach: (bufnr) =>
@@ -117,6 +228,64 @@ export default class EditTracker
         })
 
         @attached_bufs[bufnr] = true
+        vim.schedule(-> @restore_history(bufnr))
+
+    -- Seed the history of a file opened in this session with changes from
+    -- before it: the latest undo steps from its undofile, then uncommitted
+    -- git changes those do not cover, while the history has room. They go
+    -- before the session's own edits, oldest first.
+    restore_history: (bufnr) =>
+        return unless @restore and not @stopped and @attached_bufs[bufnr]
+        return unless api.nvim_buf_is_valid(bufnr) and vim.bo[bufnr].buftype == ''
+        path = api.nvim_buf_get_name(bufnr)
+        return if #path == 0 or vim.fn.filereadable(path) == 0
+        for e in *@edit_history
+            return if e.bufnr == bufnr
+        filepath = rel_path(bufnr)
+
+        -- Put entries (oldest first) before the session's edits: the newest
+        -- of them that fit the free slots, at least half the history.
+        -- Over the cap, other buffers' oldest edits go first.
+        prepend = (entries) ->
+            keep = math.max(@max_edits - #@edit_history, math.ceil(@max_edits / 2))
+            first = math.max(1, #entries - keep + 1)
+            for i = first, #entries
+                table.insert(@edit_history, i - first + 1, entries[i])
+            i = 1
+            while #@edit_history > @max_edits and i <= #@edit_history
+                if @edit_history[i].bufnr ~= bufnr
+                    table.remove(@edit_history, i)
+                else
+                    i += 1
+            while #@edit_history > @max_edits
+                table.remove(@edit_history, 1)
+
+        undo = undo_hunks(bufnr, @max_edits)
+        entries = {}
+        for i = #undo, 1, -1
+            h = undo[i]
+            prev = entries[#entries]
+            -- Successive drafts of the same lines are one change
+            if prev and prev.start_line == h.start_line and lines_equal(prev.new_lines, h.old_lines)
+                prev.new_lines = h.new_lines
+            else
+                table.insert(entries, { start_line: h.start_line, old_lines: h.old_lines, new_lines: h.new_lines })
+        restored = {}
+        for h in *entries
+            e = restored_entry(bufnr, filepath, h)
+            table.insert(restored, e) if e
+        prepend(restored)
+
+        old_set, new_set = line_set(undo, 'old_lines'), line_set(undo, 'new_lines')
+        git_hunks(path, (hunks) ->
+            return if @stopped or not @attached_bufs[bufnr]
+            git = {}
+            for h in *hunks
+                continue if covered_by(h, old_set, new_set)
+                e = restored_entry(bufnr, filepath, h)
+                table.insert(git, e) if e
+            prepend(git)
+        )
 
     -- Stop tracking: attached buffer callbacks detach on their next event
     shutdown: () =>
@@ -171,14 +340,7 @@ export default class EditTracker
         return if whitespace_only(old_lines, new_lines)
 
         -- Record the edit
-        filepath = api.nvim_buf_get_name(bufnr)
-        if #filepath == 0
-            filepath = "buffer_#{bufnr}"
-
-        -- Make filepath relative to cwd
-        cwd = vim.fn.getcwd()
-        if filepath\sub(1, #cwd) == cwd
-            filepath = filepath\sub(#cwd + 2)
+        filepath = rel_path(bufnr)
 
         edit = {
             bufnr: bufnr

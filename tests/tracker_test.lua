@@ -120,5 +120,49 @@ t2.edit_history = { entry(buf, 10, 'bab', 'baz'), entry(buf, 10, '3', '2'), entr
 eq('drafts of edited lines skipped', #t2:get_diff_sections(buf, nil, { { 10, 10 } }), 2)
 eq('no spans keeps all', #t2:get_diff_sections(buf, nil, nil), 4)
 
+
+-- A freshly opened file gets its history from its undofile, then from
+-- uncommitted git changes the undo steps don't cover
+local dir = vim.fn.tempname()
+vim.fn.mkdir(dir .. '/undo', 'p')
+vim.o.undodir = dir .. '/undo'
+vim.o.undofile = true
+local function sh(cmd) vim.fn.system(cmd); assert(vim.v.shell_error == 0, cmd) end
+local path = dir .. '/f.lua'
+vim.fn.writefile({ 'local a = 1', 'local b = 2', 'local c = 3', 'local d = 4' }, path)
+sh({ 'git', '-C', dir, 'init', '-q' })
+sh({ 'git', '-C', dir, '-c', 'user.name=t', '-c', 'user.email=t@t', '-c', 'commit.gpgsign=false', 'commit', '-q', '--allow-empty', '-m', 'x' })
+sh({ 'git', '-C', dir, 'add', 'f.lua' })
+sh({ 'git', '-C', dir, '-c', 'user.name=t', '-c', 'user.email=t@t', '-c', 'commit.gpgsign=false', 'commit', '-q', '-m', 'f' })
+-- Changed outside Neovim: only git knows
+vim.fn.writefile({ 'local a = 10', 'local b = 2', 'local c = 3', 'local d = 4' }, path)
+vim.cmd('silent edit ' .. path)
+local function step(row, text)
+    api.nvim_buf_set_lines(0, row - 1, row, false, { text })
+    vim.cmd('let &undolevels = &undolevels')
+end
+step(2, 'local b = 20')
+step(4, 'local d = 5')
+step(4, 'local d = 40')
+vim.cmd('silent write')
+vim.cmd('bwipeout')
+
+local t3 = EditTracker(config)
+vim.cmd('silent edit ' .. path)
+local fbuf = api.nvim_get_current_buf()
+eq('undo state of the buffer itself', vim.fn.undotree().seq_cur, 3)
+t3:attach(fbuf)
+vim.wait(5000, function() return #t3.edit_history >= 3 end, 20)
+local got = {}
+for _, e in ipairs(t3.edit_history) do table.insert(got, e.old_lines[1] .. ' -> ' .. e.new_lines[1]) end
+eq('restored: git change, then undo steps oldest first, drafts merged', got,
+    { 'local a = 1 -> local a = 10', 'local b = 2 -> local b = 20', 'local d = 4 -> local d = 40' })
+eq('restored entries older than any snapshot', t3.edit_history[3].tick, 0)
+eq('buffer untouched', { vim.fn.undotree().seq_cur, vim.bo[fbuf].modified }, { 3, false })
+-- Not restored again, and not for a file with session edits
+t3:restore_history(fbuf)
+eq('restore once', #t3.edit_history, 3)
+t3:shutdown()
+
 print(fails == 0 and 'ALL PASS' or (fails .. ' FAILED'))
 os.exit(fails == 0 and 0 or 1)

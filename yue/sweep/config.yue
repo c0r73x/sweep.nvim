@@ -60,6 +60,7 @@ export default class Config
         context: {
             window_radius: 10           -- Lines above/below cursor (21 total)
             max_edit_history: 6         -- Recent edit hunks to include in prompt
+            restore_history: true       -- Seed a file's history from its undofile and git diff
             max_context_files: 3        -- Recently visited files for context
             context_file_lines: 60      -- Max lines per context file chunk
         }
