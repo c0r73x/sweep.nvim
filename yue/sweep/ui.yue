@@ -219,8 +219,9 @@ export default class GhostText
 
     -- Draw the line from changes[first] on as it will be: one overlay
     -- over the old text (padded with spaces when shorter), anything
-    -- wider than the old text inline at the end of the line. Unchanged
-    -- text loses its syntax colours. false when tabs prevent it.
+    -- wider than the old text inline at the end of the line. Text that
+    -- only moves is redrawn in SweepAddition too, so the whole redrawn
+    -- part reads as preview. false when tabs prevent it.
     render_rest: (bufnr, row, line, changes, first) =>
         start = math.min(changes[first].col, #line)
         chunks = {}
@@ -228,10 +229,10 @@ export default class GhostText
         for k = first, #changes
             c = changes[k]
             col = math.min(c.col, #line)
-            table.insert(chunks, {line\sub(pos + 1, col)}) if col > pos
+            table.insert(chunks, {line\sub(pos + 1, col), 'SweepAddition'}) if col > pos
             table.insert(chunks, {c.text, 'SweepAddition'}) if #c.text > 0
             pos = math.max(pos, math.min(c.end_col, #line))
-        table.insert(chunks, {line\sub(pos + 1)}) if pos < #line
+        table.insert(chunks, {line\sub(pos + 1), 'SweepAddition'}) if pos < #line
         old_rest = line\sub(start + 1)
         return false if old_rest\find('\t')
         for chunk in *chunks

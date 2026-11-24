@@ -173,6 +173,18 @@ local cases = {
     { 'rename', 'if (barfoo) {', 'if (isTrue) {', { 'overlay@4:isTrue' } },
     { 'rename longer', 'if (ok) {', 'if (enabled) {', { 'inline@6:abled', 'overlay@4:en' } },
 }
+-- Text that only moves in a shorter line is redrawn as preview text too;
+-- the padding over the old line's end stays plain
+api.nvim_buf_set_lines(buf, 0, -1, false, { '{', base .. '"12.0.0"', '}' })
+ui:show_edit({ '{', base .. '"2.0.0"', '}' }, { bufnr = buf, window_start = 1,
+    current_lines = { '{', base .. '"12.0.0"', '}' }, line_num = 2, cursor_col = 0 })
+local over
+for _, m in ipairs(api.nvim_buf_get_extmarks(buf, ui.ns_id, 0, -1, { details = true })) do
+    if m[4].virt_text_pos == 'overlay' then over = m[4].virt_text end
+end
+ui:hide()
+check('moved text highlight', over, { { '2', 'SweepAddition' }, { '.0.0"', 'SweepAddition' }, { ' ' } })
+
 for _, c in ipairs(cases) do
     local m, scr = render_line(c[2], c[3])
     if c[4] then check(c[1] .. ' marks', m, c[4]) end
