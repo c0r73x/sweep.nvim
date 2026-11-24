@@ -176,9 +176,10 @@ export default class GhostText
                 }))
             if #change.text > 0
                 table.insert(@extmark_ids, api.nvim_buf_set_extmark(bufnr, @ns_id, row, end_col, {
+                    -- Not 'combine': that mixes in the syntax colour of
+                    -- the text it is attached to
                     virt_text: {{change.text, 'SweepAddition'}}
                     virt_text_pos: 'inline'
-                    hl_mode: 'combine'
                 }))
 
     -- anchor: 0-indexed row the lines go below (-1 = above the first line)
