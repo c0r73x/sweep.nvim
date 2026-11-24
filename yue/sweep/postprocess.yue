@@ -44,14 +44,30 @@ fim_scope = (before, after, below, max_lines=8) ->
         'body'
     else
         'block'
-    { :kind, :base, :max_lines }
+    -- at_end: nothing follows in this block, so new statements may
+    -- continue it
+    { :kind, :base, :max_lines, at_end: not nxt or indent(nxt) < base }
+
+-- A block completion whose first line is blank finishes the cursor's
+-- line and starts on the next one (the blank line is not counted)
+starts_below = (lines, scope) ->
+    scope.kind == 'block' and #lines > 1 and not lines[1]\find('%S')
+
+line_limit = (lines, scope) ->
+    return 1 if scope.kind == 'line'
+    scope.max_lines + (starts_below(lines, scope) and 1 or 0)
 
 -- Lines of a FIM completion to keep, and whether its end was found.
 -- Only lines 2..n_complete are judged (a streamed last line may grow).
 fim_cut = (lines, scope, n_complete=#lines) ->
     keep = math.min(1, #lines)
+    limit = line_limit(lines, scope)
+    kind = scope.kind
+    -- Below a finished line, the first line at the cursor's indent is a
+    -- new statement, cut like one typed on a fresh line
+    started = not starts_below(lines, scope)
     for i = 2, n_complete
-        return keep, true if scope.kind == 'line' or keep >= scope.max_lines
+        return keep, true if kind == 'line' or keep >= limit
         line = lines[i]
         s = trim(line)
         if s == ''
@@ -59,7 +75,12 @@ fim_cut = (lines, scope, n_complete=#lines) ->
             continue
         ind = indent(line)
         return keep, true if ind < scope.base
-        if ind == scope.base and scope.kind == 'block'
+        unless started
+            started = true
+            kind = 'body' if ind == scope.base and scope.at_end
+            keep = i
+            continue
+        if ind == scope.base and kind == 'block'
             if matches(s, CONTINUERS)
                 keep = i
                 continue
@@ -68,13 +89,13 @@ fim_cut = (lines, scope, n_complete=#lines) ->
         keep = i
     keep, false
 
-DEFAULT_SCOPE = { kind: 'block', base: 0, max_lines: 8 }
+DEFAULT_SCOPE = { kind: 'block', base: 0, max_lines: 8, at_end: true }
 
 -- Should a FIM stream stop now? Once a finished line ends the
 -- completion, a new line dedents past the cursor, or the cap is hit.
 fim_should_stop = (text, scope=DEFAULT_SCOPE) ->
     lines = vim.split(text, '\n', { plain: true })
-    return true if #lines > (scope.kind == 'line' and 1 or scope.max_lines)
+    return true if #lines > line_limit(lines, scope)
     _, done = fim_cut(lines, scope, #lines - 1)
     return true if done
     last = lines[#lines]
