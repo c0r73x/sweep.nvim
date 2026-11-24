@@ -75,6 +75,15 @@ local inline_cases = {
     { 'låt x = "å"', 'låt y = "ä"', true },
     { '', '    foo()', true },
     { '    return x', '    if y then', false },
+    -- One word renamed in a short line: little text left in common, but
+    -- still read in place
+    { 'if (barfoo) {', 'if (isTrue) {', true },
+    { 'barfoo', 'isTrue', true },
+    { 'x = "日本"', 'x = "日"', true },
+    -- Two words changed: not a rename
+    { 'x = 1', 'y = 2', false },
+    -- A word replaced by more than a word
+    { 'if (barfoo) {', 'if (this.isTrue) {', false },
 }
 for i, c in ipairs(inline_cases) do
     local r = Diff.inline_changes(c[1], c[2])
@@ -161,6 +170,8 @@ local cases = {
     { 'insert then shorter', 'g(a, 10)', 'g(a, b, 3)', { 'inline@7: 3', 'overlay@5:b,' } },
     { 'wide characters', 'local title = "日本" -- heading', 'local title = "日" -- heading', { 'overlay@15:日' } },
     { 'tab before the change', '\tx = 10', '\tx = 2', { 'overlay@5:2' } },
+    { 'rename', 'if (barfoo) {', 'if (isTrue) {', { 'overlay@4:isTrue' } },
+    { 'rename longer', 'if (ok) {', 'if (enabled) {', { 'inline@6:abled', 'overlay@4:en' } },
 }
 for _, c in ipairs(cases) do
     local m, scr = render_line(c[2], c[3])

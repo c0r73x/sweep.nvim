@@ -91,12 +91,15 @@ tokenize = (s) ->
     return tokens
 
 nonblank_len = (s) -> #(s\gsub('%s+', ''))
+is_word = (s) -> s\find('^[%w_\128-\255]+$') ~= nil
 
 -- How to turn old_line into new_line in place, as a list of
 -- { col, end_col, text } with 0-indexed byte columns into old_line:
 -- old_line[col, end_col) goes away and text appears at end_col.
 -- score is the share of non-blank text the lines have in common (a blank
 -- line on either side scores MIN_INLINE_SCORE: fill or empty it in place).
+-- A single word replaced by another word (a rename, a new value) scores
+-- at least MIN_INLINE_SCORE too, however little of a short line is left.
 -- Returns nil when the lines are too long to compare.
 inline_changes = (old_line, new_line) ->
     a, b = tokenize(old_line), tokenize(new_line)
@@ -129,6 +132,10 @@ inline_changes = (old_line, new_line) ->
         MIN_INLINE_SCORE
     else
         2 * equal_len / (old_len + new_len)
+    if score < MIN_INLINE_SCORE and #changes == 1
+        c = changes[1]
+        if is_word(old_line\sub(c.col + 1, c.end_col)) and is_word(c.text)
+            score = MIN_INLINE_SCORE
 
     return { changes: changes, score: score }
 
