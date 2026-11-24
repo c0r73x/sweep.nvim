@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Overview
 
-sweep.nvim is a Neovim plugin for AI-powered inline completions and edit predictions. It uses a local `sweep-next-edit` GGUF model via a Python proxy process, communicating over Unix sockets (with HTTP fallback).
+sweep.nvim is a Neovim plugin for AI-powered inline completions and edit predictions. It uses the `sweep-next-edit` GGUF model through llama.cpp's `llama-server`, which the plugin starts on a Unix socket (shared by all Neovims, stopped when idle) and talks to over HTTP directly.
 
 ## Build
 
@@ -23,8 +23,8 @@ The plugin is written in [YueScript](https://github.com/IppClub/YueScript), a Co
 
 ### Two-process design
 
-1. **Neovim plugin** (`lua/sweep.lua` + `lua/sweep/`) — handles UI, buffer state, keymaps, and communication
-2. **Python proxy** (`proxy/sweep_proxy.py`) — single FastAPI/llama-cpp-python server shared across all Neovim instances, listens on Unix socket + HTTP
+1. **Neovim plugin** (`lua/sweep.lua` + `lua/sweep/`) — handles UI, buffer state, keymaps, prompts and post-processing
+2. **llama-server** — started by `bin/sweep-server` (POSIX sh: lock dir next to the socket so one server per user, idle shutdown by watching `llamacpp:n_decode_total` on `/metrics`). Flags in `server.yue` `command()`: 2 slots, `--spec-type ngram-simple` (prompt-lookup speculation, ~4x faster edits), `--cache-ram`. With `provider.url` set, an external server is used and never started.
 
 ### Plugin module map (`yue/sweep/`)
 
@@ -32,7 +32,10 @@ The plugin is written in [YueScript](https://github.com/IppClub/YueScript), a Co
 |--------|----------------|
 | `sweep.yue` | Main `Sweep` class; orchestrates all other modules; entry point for `setup()` |
 | `config.yue` | Default configuration and highlight group setup |
-| `client.yue` | Network layer: Unix socket (preferred) or HTTP fallback; builds FIM and edit prompts |
+| `client.yue` | Builds FIM and edit prompts, streams `/completion`, cancels superseded requests, restarts the server on connect errors |
+| `http.yue` | Minimal HTTP/1.1 client over libuv (Unix socket or TCP), SSE streaming, abort |
+| `server.yue` | Managed llama-server: socket path, command line, spawn via `bin/sweep-server`, health / `ensure()` |
+| `postprocess.yue` | Pure functions: FIM trimming and early stop, edit hunks near the cursor, truncated-output handling |
 | `buffer.yue` | Buffer state snapshots, context window extraction, Treesitter integration, applying updates |
 | `cache.yue` | LRU cache (100 entries, 5s TTL) keyed on context to avoid duplicate requests |
 | `tracker.yue` | Records edit history (6 edits) and recent file visits (3 files) for prompt context |
@@ -40,13 +43,13 @@ The plugin is written in [YueScript](https://github.com/IppClub/YueScript), a Co
 | `diff.yue` | LCS-based line diff engine used to compute hunks for edit mode display |
 | `autocmds.yue` | Autocommand setup: debounced TextChangedI (FIM), CursorHold (edit prediction) |
 | `keymaps.yue` | Conditional keymap setup (Tab accept, Esc reject) |
-| `lualine.yue` | Optional lualine component showing proxy status and spinner |
+| `lualine.yue` | Optional lualine component showing server status and spinner |
 
 ### Completion flow
 
-**FIM mode (insert):** `TextChangedI` → debounce → `client.build_fim_prompt()` → proxy → `ui.show_fim()` (extmarks) → Tab → insert text
+**FIM mode (insert):** `TextChangedI` → debounce → `client.build_fim_prompt()` → llama-server → `postprocess.post_process_fim()` → `ui.show_fim()` (extmarks) → Tab → insert text
 
-**Edit prediction mode (normal):** `CursorHold` → `tracker.get_diff_sections()` + `tracker.get_context_files()` → `client.build_edit_prompt()` → proxy → `diff.diff()` → `ui.show_edit()` (virtual diff extmarks) → Tab → `buffer.apply_update()`
+**Edit prediction mode (normal):** `CursorHold` → `tracker.get_diff_sections()` + `tracker.get_context_files()` → `client.build_edit_prompt()` → llama-server → `postprocess.post_process_edit()` → `diff.diff()` → `ui.show_edit()` (virtual diff extmarks) → Tab → `buffer.apply_update()`
 
 ### Prompt formats
 
@@ -55,12 +58,17 @@ The plugin is written in [YueScript](https://github.com/IppClub/YueScript), a Co
 
 ### Transport
 
-Client tries Unix socket at `/tmp/sweep-<uid>.sock` (or `$XDG_RUNTIME_DIR/sweep.sock`) first; falls back to `curl` HTTP POST to `http://127.0.0.1:5555/v1/completions`.
+Managed server socket: `$XDG_RUNTIME_DIR/sweep-server.sock` or `/tmp/sweep-server-<uid>.sock` (sun_path limit ~104 bytes, so not under stdpath). Requests are streamed (`stream: true`): closing the connection makes llama-server stop generating, non-streamed requests keep generating. Server log: `stdpath('log')/sweep-server.log`.
 
 ## User-facing commands
 
 `SweepStatus`, `SweepCache`, `SweepReload`, `SweepHide`, `SweepToggle`, `SweepEdit` — all defined in `sweep.yue`.
 
-## No tests
+## Tests
 
-There are no automated tests in this repo.
+Headless, no framework:
+
+```bash
+nvim --headless --clean --cmd 'set rtp^=.' -l tests/postprocess_test.lua
+nvim --headless --clean --cmd 'set rtp^=.' -l tests/diff_test.lua
+```

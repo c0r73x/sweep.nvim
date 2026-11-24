@@ -54,11 +54,15 @@ text_changed_callback = () ->
         stop_timer(ct)
         ct\trigger_completion(bufnr)
 
--- Normal mode text change (undo, paste, ...): predictions are stale
+-- Normal mode text change (undo, paste, accepted edit, ...): predictions
+-- are stale, and the next CursorHold may predict again even if the cursor
+-- didn't move
 text_changed_normal_callback = () ->
     ct = _G.sweep
     return unless ct
     ct\reject()
+    ct\cancel_request()
+    stop_timer(ct)
 
 -- Insert mode cursor move: FIM ghost text is only valid at its position
 cursor_moved_insert_callback = () ->
@@ -75,8 +79,9 @@ insert_enter_callback = () ->
     ct = _G.sweep
     return unless ct
     bufnr = api.nvim_get_current_buf()
-    -- Clear any existing edit predictions when entering insert mode
+    -- Clear any existing edit predictions (and one still in flight)
     ct\reject()
+    ct\cancel_request()
     stop_timer(ct)
     -- Snapshot original state for sweep prompt (original vs current)
     ct.buffer_state\snapshot_original(bufnr)
@@ -84,9 +89,10 @@ insert_enter_callback = () ->
 insert_leave_callback = () ->
     ct = _G.sweep
     return unless ct
-    -- Clear all ghost text when leaving insert mode
+    -- Clear all ghost text when leaving insert mode, drop a FIM request in
+    -- flight and any pending debounce timer
     ct\reject()
-    -- Also clear any pending debounce timers
+    ct\cancel_request()
     stop_timer(ct)
 
 mode_changed_callback = () ->
@@ -106,6 +112,15 @@ cursor_moved_normal_callback = () ->
     mode = vim.api.nvim_get_mode().mode
     if mode == 'n' and ct.config.behavior.hide_on_cursor_move
         ct\reject()
+
+    -- An edit prediction in flight for another line would be discarded on
+    -- arrival: abort it so CursorHold can request one for the new line
+    inflight = ct._inflight
+    if inflight and inflight.mode == 'edit'
+        moved = api.nvim_get_current_buf() ~= inflight.bufnr or
+            (ct.config.behavior.hide_on_cursor_move and
+                api.nvim_win_get_cursor(0)[1] ~= inflight.line_num)
+        ct\cancel_request() if moved
 
     -- Clear debounce timer when cursor moves
     stop_timer(ct)
@@ -158,13 +173,21 @@ buf_leave_callback = () ->
     ct = _G.sweep
     return unless ct
     ct\reject()
+    ct\cancel_request()
     stop_timer(ct)
+    bufnr = api.nvim_get_current_buf()
+    ct.tracker\track_leave(bufnr)
     -- Only clear transient window state, preserve original_all_lines
     -- so edit mode retains its baseline across buffer switches
-    bufnr = api.nvim_get_current_buf()
     state = ct.buffer_state.buffer_states[bufnr]
     if state
         state.current_window = nil
+
+buf_wipeout_callback = (args) ->
+    ct = _G.sweep
+    return unless ct
+    ct.buffer_state\forget(args.buf)
+    ct.tracker\forget(args.buf)
 
 -- Autocmd callbacks that return a truthy value are deleted (and Yue
 -- returns the last expression implicitly), so never return anything
@@ -172,73 +195,11 @@ no_return = (fn) -> (args) ->
     fn(args)
     return
 
--- Check port availability asynchronously
-check_port_listening = (port, on_listening, on_free) ->
-    client = vim.uv.new_tcp()
-    client\connect('127.0.0.1', port, (err) ->
-        if err
-            client\close()
-            vim.schedule(on_free) if on_free
-        else
-            client\close()
-            vim.schedule(on_listening) if on_listening
-    )
-
-proxy_exit_callback = (job_id, code) ->
-    if code ~= 0
-        ct = _G.sweep
-        proxy_url = ct and ct.config.provider.url or 'http://127.0.0.1:5555'
-        url_parts = vim.split(proxy_url, '://')[2]
-        port = tonumber(vim.split(url_parts, ':')[2]) or 5555
-
-        check_port_listening(port,
-            (-> return),
-            (-> vim.notify("Sweep: Sweep proxy exited - model file not found or dependencies missing", vim.log.levels.WARN))
-        )
-
--- Poll every 500ms until the proxy socket exists, then health-check it
-wait_for_socket = (ct, tries) ->
-    if vim.uv.fs_stat(ct.client.sock_path)
-        ct.client\health_check()
-    elseif tries > 0
-        vim.defer_fn((-> wait_for_socket(ct, tries - 1)), 500)
-    else
-        ct.client\health_check()
-
+-- Start (or find) the server early so the first completion is fast
 very_lazy_callback = () ->
     ct = _G.sweep
     return unless ct and ct.config.enabled
-
-    unless ct.config.provider.auto_start
-        ct.client\health_check()
-        return
-
-    proxy_url = ct.config.provider.url
-    url_parts = vim.split(proxy_url, '://')[2]
-    port = tonumber(vim.split(url_parts, ':')[2]) or 5555
-
-    check_port_listening(port,
-        (->
-            -- Proxy already running, warm up connection with health check
-            ct.client\health_check()
-        ),
-        (->
-            proxy_script = ct.config.provider.proxy_script
-            if vim.uv.fs_stat(proxy_script)
-                job_opts = {
-                    detach: true
-                    on_exit: proxy_exit_callback
-                }
-                env = vim.deepcopy(ct.config.provider.env or {})
-                model_path = ct.config.provider.model_path
-                env.MODEL_PATH = model_path if model_path
-                job_opts.env = env if next(env)
-                vim.fn.jobstart({'python3', proxy_script}, job_opts)
-                -- Warm up once the socket appears (the proxy binds it before
-                -- loading the model), rather than guessing a fixed delay
-                wait_for_socket(ct, 60)
-        )
-    )
+    ct.client\health_check()
 
 export default {
     stop_timer: stop_timer
@@ -296,14 +257,22 @@ export default {
             callback: no_return(buf_leave_callback)
         })
 
+        api.nvim_create_autocmd('BufWipeout', {
+            group: augroup
+            callback: no_return(buf_wipeout_callback)
+        })
+
         api.nvim_create_autocmd('User', {
             group: augroup
             pattern: 'VeryLazy'
             callback: no_return(very_lazy_callback)
         })
 
-        -- If VeryLazy already fired (plugin loaded by VeryLazy event),
-        -- the autocmd above will never trigger. Run startup logic now.
+        -- Loaded late (VeryLazy, InsertEnter, :SweepReload): VeryLazy and
+        -- the current buffer's BufEnter have already fired, so run them now
         if vim.v.vim_did_enter == 1
-            vim.schedule(very_lazy_callback)
+            vim.schedule(->
+                buf_enter_callback()
+                very_lazy_callback()
+            )
 }

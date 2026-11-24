@@ -20,12 +20,6 @@ trigger_callback = () ->
     if ct and ct.ghost_text
         ct\trigger_completion(api.nvim_get_current_buf())
 
--- Normal mode accept
-normal_accept_callback = () ->
-    ct = _G.sweep
-    if ct and ct.ghost_text and ct.ghost_text\has_completion()
-        ct\accept()
-
 -- Normal mode reject (pass through Esc if no completion)
 normal_reject_callback = () ->
     ct = _G.sweep
@@ -47,7 +41,10 @@ export default {
 
         if sweep.config.keymaps.sweep
             key = sweep.config.keymaps.sweep
-            vim.keymap.set('n', key, normal_accept_callback, {
+            -- Expr mapping: without a prediction the key keeps its own
+            -- meaning (<Tab> is <C-i>, jump forward)
+            vim.keymap.set('n', key, make_accept_callback(key), {
+                expr: true
                 desc: 'Accept Sweep edit prediction'
             })
 

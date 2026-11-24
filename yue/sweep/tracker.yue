@@ -8,6 +8,10 @@ api = vim.api
 -- entry, so typing a word doesn't fill the history with one entry per key
 COALESCE_NS = 1e9
 
+-- Bigger changes (pastes, deleting a block, :%s) say little about the next
+-- edit and would crowd the model's context, so they aren't recorded
+MAX_EDIT_LINES = 40
+
 -- Replace snapshot[first+1 .. last] with new_lines in place
 splice = (snapshot, first, last, new_lines) ->
     n = #snapshot
@@ -56,6 +60,9 @@ export default class EditTracker
         @context_file_lines = ctx.context_file_lines or 60
         behavior = config.behavior or {}
         @max_file_lines = behavior.max_file_lines or 10000
+        @ignore_ft = {}
+        for ft in *(behavior.ignore_filetypes or {})
+            @ignore_ft[ft] = true
         @attached_bufs = {}
         @line_snapshots = {}
         @edit_history = {}
@@ -69,6 +76,7 @@ export default class EditTracker
         return if @attached_bufs[bufnr]
         return unless api.nvim_buf_is_valid(bufnr)
         return if vim.bo[bufnr].buftype ~= ''
+        return if @ignore_ft[vim.bo[bufnr].filetype]
         -- Huge buffers are never completed, so don't pay for tracking them
         return if @max_file_lines > 0 and
             api.nvim_buf_line_count(bufnr) > @max_file_lines
@@ -122,8 +130,9 @@ export default class EditTracker
         new_lines = api.nvim_buf_get_lines(bufnr, first_line, new_last_line, false)
         splice(snapshot, first_line, last_line, new_lines)
 
-        -- Skip trivial changes (identical content)
+        -- Skip trivial changes (identical content) and big ones
         return if lines_equal(old_lines, new_lines)
+        return if #old_lines > MAX_EDIT_LINES or #new_lines > MAX_EDIT_LINES
 
         now = vim.uv.hrtime()
 
@@ -198,6 +207,19 @@ export default class EditTracker
         -- Trim to MAX_RECENT_FILES (excluding current buffer)
         while #@recent_files > @max_recent_files + 1
             table.remove(@recent_files, 1)
+
+    -- Remember where the cursor was when leaving a buffer, so its context
+    -- chunk is centered there
+    track_leave: (bufnr) =>
+        return unless api.nvim_buf_is_valid(bufnr)
+        line = api.nvim_win_get_cursor(0)[1]
+        for entry in *@recent_files
+            entry.cursor_line = line if entry.bufnr == bufnr
+
+    -- Buffer wiped out: drop it from the recent files
+    forget: (bufnr) =>
+        for i = #@recent_files, 1, -1
+            table.remove(@recent_files, i) if @recent_files[i].bufnr == bufnr
 
     -- Get formatted diff sections for the sweep prompt
     -- Returns list of strings, each a complete <|file_sep|>...original:...updated: block

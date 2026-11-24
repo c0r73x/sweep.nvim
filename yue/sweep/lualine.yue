@@ -17,14 +17,13 @@ sweep_component.update_status = () =>
 
     -- Server status
     connected = ct.client and ct.client.connected
-    transport = ct.client and ct.client.transport
 
     if ct\is_processing()
         -- Animate spinner during processing
         sweep_component.spinner_index = (sweep_component.spinner_index % sweep_component.spinner_symbols_len) + 1
         spinner = sweep_component.spinner_symbols[sweep_component.spinner_index]
         return "#{spinner} SW"
-    elseif connected or transport == 'http'
+    elseif connected
         -- Server is available
         return '● SW'
     else

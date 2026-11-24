@@ -98,7 +98,7 @@ class Sweep
             "fim\0#{context.cursor_offset}\0#{context.cursor_col}\0#{cur}"
         else
             orig = table.concat(context.original_lines or {}, '\n')
-            "edit\0#{context.filepath}\0#{orig}\0#{cur}"
+            "edit\0#{context.filepath}\0#{context.cursor_offset}\0#{orig}\0#{cur}"
 
     -- Main completion trigger
     trigger_completion: (bufnr) =>
@@ -112,35 +112,35 @@ class Sweep
 
         if @processing
             -- Mark that new input arrived; the current request is aborted
-            -- (proxy-side) and a fresh one sent once it has finished.
+            -- (server-side) and a fresh one sent once it has finished.
             unless @_pending_retrigger
                 @client\cancel()
             @_pending_retrigger = bufnr
             return
 
         -- Don't request completions if blink menu is visible
-        -- This prevents wasted proxy requests
+        -- This prevents wasted requests
         if @ghost_text and @ghost_text\should_hide_for_blink()
             @log("Blink menu visible, skipping request")
-            return
-
-        -- Read the buffer now (after debounce), not on every keystroke
-        @buffer_state\update_state(bufnr)
-        context = @buffer_state\get_context(bufnr)
-        unless context
-            @log("No context for buffer #{bufnr}")
             return
 
         -- Auto-select mode: FIM for insert mode, edit/sweep for normal mode
         configured_mode = @config.provider.mode or 'auto'
         mode = if configured_mode == 'auto'
-            vim_mode = vim.api.nvim_get_mode().mode
-            if vim_mode == 'i'
+            -- 'i' plus submodes such as 'ic' (completion menu open)
+            if api.nvim_get_mode().mode\sub(1, 1) == 'i'
                 'fim'
             else
                 'edit'
         else
             configured_mode
+
+        -- Read the buffer now (after debounce), not on every keystroke
+        @buffer_state\update_state(bufnr)
+        context = @buffer_state\get_context(bufnr, mode)
+        unless context
+            @log("No context for buffer #{bufnr}")
+            return
 
         @request(mode, context)
 
@@ -159,12 +159,14 @@ class Sweep
         @_request_seq = (@_request_seq or 0) + 1
         seq = @_request_seq
         @set_processing(true)
+        @_inflight = { :mode, :bufnr, line_num: context.line_num }
         @log("Requesting #{mode} completion...")
         @client\request_completion(mode, context, @tracker, (result, err) ->
             vim.schedule(->
                 -- Cleared (or replaced) while in flight
                 return unless seq == @_request_seq
                 @set_processing(false)
+                @_inflight = nil
 
                 -- If new input arrived while we were processing,
                 -- discard this stale result and retrigger fresh.
@@ -176,17 +178,27 @@ class Sweep
                     return
 
                 -- Discard if vim mode no longer matches request mode,
-                -- then retrigger for the correct mode.
-                vim_mode = vim.api.nvim_get_mode().mode
-                mode_mismatch = (mode == 'fim' and vim_mode ~= 'i') or
-                    (mode == 'edit' and vim_mode == 'i')
+                -- then retrigger for the correct mode. Only in 'auto':
+                -- with a fixed mode the retrigger would request the same
+                -- mode again, forever.
+                vim_mode = api.nvim_get_mode().mode
+                in_insert = vim_mode\sub(1, 1) == 'i'
+                mode_mismatch = (mode == 'fim' and not in_insert) or
+                    (mode == 'edit' and in_insert)
                 if mode_mismatch
-                    @log("#{mode} response in #{vim_mode} mode, retriggering")
-                    @trigger_completion(bufnr)
+                    if (@config.provider.mode or 'auto') == 'auto'
+                        @log("#{mode} response in #{vim_mode} mode, retriggering")
+                        @trigger_completion(bufnr)
+                    else
+                        @log("#{mode} response in #{vim_mode} mode, discarding")
                     return
 
                 if err
-                    @log("Error: #{err}", vim.log.levels.WARN)
+                    -- Aborted on purpose (superseded, toggled off, ...)
+                    if err == 'Cancelled'
+                        @log("Request cancelled")
+                    else
+                        @log("Error: #{err}", vim.log.levels.WARN)
                     return
 
                 unless result
@@ -266,14 +278,20 @@ class Sweep
     reject: () =>
         @ghost_text\hide()
 
+    -- Abort the request in flight (the server stops generating) and
+    -- ignore its response
+    cancel_request: () =>
+        @_request_seq = (@_request_seq or 0) + 1
+        @_pending_retrigger = nil
+        @_inflight = nil
+        @set_processing(false)
+        @client\cancel() if @client
+
     -- Clear all state
     clear: () =>
         @ghost_text\hide()
         @cache\clear()
-        -- Ignore the response of any request still in flight
-        @_request_seq = (@_request_seq or 0) + 1
-        @_pending_retrigger = nil
-        @set_processing(false)
+        @cancel_request()
 
     -- Stop timers, callbacks and the connection of a previous setup()
     shutdown: () =>
@@ -314,7 +332,7 @@ class Sweep
             "Processing: #{@is_processing()}"
             "Ghost text visible: #{@ghost_text\has_completion()}"
             "Blink menu visible: #{@ghost_text.blink_menu_visible}"
-            "Socket: #{@client.sock_path}"
+            "Server: #{@client.server\describe()}"
             "Connected: #{@client.connected}"
             "Edit history: #{#@tracker.edit_history} edits"
             "Recent files: #{#@tracker.recent_files} files"
@@ -338,7 +356,7 @@ class Sweep
         vim.notify("Sweep: Reloading...", vim.log.levels.INFO)
         saved_opts = @_setup_opts or {}
         @shutdown()
-        for mod in *{'sweep', 'sweep.sweep', 'sweep.config', 'sweep.buffer', 'sweep.cache', 'sweep.client', 'sweep.ui', 'sweep.keymaps', 'sweep.autocmds', 'sweep.diff', 'sweep.tracker'}
+        for mod in *{'sweep', 'sweep.sweep', 'sweep.config', 'sweep.buffer', 'sweep.cache', 'sweep.client', 'sweep.ui', 'sweep.keymaps', 'sweep.autocmds', 'sweep.diff', 'sweep.tracker', 'sweep.http', 'sweep.server', 'sweep.postprocess'}
             package.loaded[mod] = nil
 
         -- Must nil the global so the module creates a fresh instance
@@ -354,7 +372,8 @@ class Sweep
         @config.enabled = not @config.enabled
         state = @config.enabled and 'enabled' or 'disabled'
         if not @config.enabled
-            @client\disconnect()
+            @reject()
+            @cancel_request()
         vim.notify("Sweep: #{state}", vim.log.levels.INFO)
 
     -- Manually trigger edit prediction (for normal mode)
@@ -369,7 +388,7 @@ class Sweep
 
         return if @processing
 
-        context = @buffer_state\get_context(bufnr)
+        context = @buffer_state\get_context(bufnr, 'edit')
         return unless context
 
         @request('edit', context)

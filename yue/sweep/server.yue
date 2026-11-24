@@ -1,0 +1,126 @@
+-- llama-server lifecycle.
+--
+-- By default sweep.nvim runs one llama-server per user on a Unix socket,
+-- shared by every Neovim. bin/sweep-server starts it (once, guarded by a
+-- lock) and stops it after `idle_timeout` seconds without decoding; the
+-- next request starts it again. With `provider.url` set, an external
+-- server is used as-is and never started.
+
+http = require('sweep.http')
+uv = vim.uv
+
+-- Plugin root (<root>/lua/sweep/server.lua)
+PLUGIN_ROOT = vim.fn.fnamemodify(debug.getinfo(1, 'S').source\sub(2), ':p:h:h:h')
+WRAPPER = "#{PLUGIN_ROOT}/bin/sweep-server"
+HF_REPO = 'sweepai/sweep-next-edit-1.5B'
+HF_FILE = 'sweep-next-edit-1.5b.q8_0.v2.gguf'
+
+-- Unix socket paths are limited to ~104 bytes, so not under stdpath()
+default_socket = ->
+    dir = os.getenv('XDG_RUNTIME_DIR')
+    return "#{dir}/sweep-server.sock" if dir and dir ~= ''
+    "/tmp/sweep-server-#{uv.getuid()}.sock"
+
+export default class Server
+    new: (config) =>
+        @provider = config.provider
+        @sock = not @provider.url and (@provider.socket or default_socket()) or nil
+        @log_path = "#{vim.fn.stdpath('log')}/sweep-server.log"
+        @waiters = nil
+
+    managed: => @sock ~= nil
+
+    -- Connection options for http.request
+    endpoint: => @sock and { sock: @sock } or { url: @provider.url }
+
+    describe: => @sock and "#{@sock} (managed)" or @provider.url
+
+    -- callback(state, err): state is 'ok', 'loading' or 'down'
+    health: (callback) =>
+        opts = vim.tbl_extend('force', @endpoint(), { path: '/health', timeout: 2000 })
+        http.request(opts, (err, status) ->
+            if err
+                callback('down', err)
+            elseif status == 200
+                callback('ok')
+            elseif status == 503
+                callback('loading')
+            else
+                callback('down', "HTTP #{status}")
+        )
+
+    command: =>
+        p = @provider
+        cmd = { p.server_cmd or 'llama-server' }
+        if p.model_path
+            vim.list_extend(cmd, { '-m', vim.fn.expand(p.model_path) })
+        else
+            vim.list_extend(cmd, { '-hfr', HF_REPO, '-hff', HF_FILE })
+        -- Two slots so FIM and edit prompts (and other Neovims) keep their
+        -- KV cache; prompt-lookup speculation makes edits ~4x faster, since
+        -- the rewritten window mostly copies the prompt
+        vim.list_extend(cmd, {
+            '-c', '16384', '-np', '2', '-ngl', '99', '-fa', 'on'
+            '--spec-type', 'ngram-simple', '--cache-ram', '512', '--no-webui'
+        })
+        vim.list_extend(cmd, p.server_args or {})
+        cmd
+
+    -- Start bin/sweep-server detached, so it outlives this Neovim.
+    -- on_exit(code) runs if it exits while Neovim is still running (0 also
+    -- when another instance already holds the lock).
+    spawn: (on_exit) =>
+        cmd = @command()
+        unless vim.fn.executable(cmd[1]) == 1
+            return false, "#{cmd[1]} not found: install llama.cpp or set provider.server_cmd"
+        env = vim.fn.environ()
+        for k, v in pairs(@provider.env or {})
+            env[k] = tostring(v)
+        args = { WRAPPER, @sock, tostring(@provider.idle_timeout or 900), @log_path }
+        vim.list_extend(args, cmd)
+        local handle
+        handle, pid_or_err = uv.spawn('sh', {
+            args: args
+            env: ["#{k}=#{v}" for k, v in pairs(env)]
+            detached: true
+        }, (code) ->
+            handle\close() if handle and not handle\is_closing()
+            vim.schedule(-> on_exit(code))
+        )
+        return false, "Failed to start #{WRAPPER}: #{pid_or_err}" unless handle
+        handle\unref()
+        true
+
+    -- callback(ok, err) once the server is healthy, starting it when it is
+    -- managed and down. Concurrent calls share one attempt.
+    ensure: (callback) =>
+        if @waiters
+            table.insert(@waiters, callback)
+            return
+        @waiters = { callback }
+        finish = (ok, err) ->
+            waiters = @waiters
+            @waiters = nil
+            for cb in *waiters
+                cb(ok, err)
+
+        started = false
+        exit_code = nil
+        -- First start may download the model (~1.6 GB)
+        deadline = uv.now() + (@provider.start_timeout or 300000)
+        poll = ->
+            @health((state, err) ->
+                return finish(true) if state == 'ok'
+                if state == 'down' and not started
+                    unless @managed() and @provider.auto_start ~= false
+                        return finish(false, "No llama-server at #{@describe()}: #{err}")
+                    started = true
+                    ok, serr = @spawn((code) -> exit_code = code)
+                    return finish(false, serr) unless ok
+                if exit_code and exit_code ~= 0
+                    return finish(false, "llama-server exited with #{exit_code}, see #{@log_path}")
+                if uv.now() > deadline
+                    return finish(false, "llama-server not ready, see #{@log_path}")
+                vim.defer_fn(poll, 250)
+            )
+        poll()

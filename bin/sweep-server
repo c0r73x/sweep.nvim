@@ -1,0 +1,73 @@
+#!/bin/sh
+# Run llama-server for sweep.nvim: one per user, shared by every Neovim.
+#
+# Usage: sweep-server <socket> <idle-seconds> <log> <llama-server> [args...]
+#
+# Exits right away when another instance holds the lock. Otherwise starts
+# llama-server on <socket> and stops it once its decode counter has not
+# moved for <idle-seconds> (0 = never).
+
+set -u
+sock=$1 idle=$2 log=$3
+shift 3
+
+lock="$sock.lock"
+if ! mkdir "$lock" 2>/dev/null; then
+    pid=$(cat "$lock/pid" 2>/dev/null)
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+        exit 0
+    fi
+    # Stale lock from a killed instance
+    rm -rf "$lock"
+    mkdir "$lock" 2>/dev/null || exit 0
+fi
+echo $$ >"$lock/pid"
+
+exec >"$log" 2>&1
+
+srv= watcher=
+cleanup() {
+    [ -n "$watcher" ] && kill "$watcher" 2>/dev/null
+    [ -n "$srv" ] && kill "$srv" 2>/dev/null && wait "$srv" 2>/dev/null
+    rm -f "$sock"
+    rm -rf "$lock"
+}
+trap cleanup EXIT
+trap 'exit 0' INT TERM HUP
+
+# A socket file left by a killed server would make the bind fail
+rm -f "$sock"
+"$@" --host "$sock" --metrics &
+srv=$!
+
+# Stop the server once nothing has been decoded for $idle seconds
+if [ "$idle" -gt 0 ]; then
+    (
+        step=30 last= quiet=0
+        while kill -0 "$srv" 2>/dev/null; do
+            sleep "$step"
+            n=$(curl -s --max-time 5 --unix-socket "$sock" http://localhost/metrics |
+                sed -n 's/^llamacpp:n_decode_total //p')
+            if [ -n "$n" ] && [ "$n" = "$last" ]; then
+                quiet=$((quiet + step))
+            else
+                quiet=0
+                last=$n
+            fi
+            if [ "$quiet" -ge "$idle" ]; then
+                echo "sweep-server: idle for ${quiet}s, stopping"
+                touch "$lock/idle"
+                kill "$srv"
+                exit 0
+            fi
+        done
+    ) &
+    watcher=$!
+fi
+
+wait "$srv"
+code=$?
+srv=
+[ -e "$lock/idle" ] && code=0
+[ "$code" -ne 0 ] && echo "sweep-server: llama-server exited with $code"
+exit "$code"

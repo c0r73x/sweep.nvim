@@ -1,0 +1,150 @@
+-- Minimal HTTP/1.1 client on libuv, over a Unix socket or TCP.
+--
+-- Each request opens its own connection (Connection: close), so closing
+-- the handle aborts it; llama-server stops a streamed generation as soon
+-- as its client is gone. Responses may be chunked; 200 responses of a
+-- streaming request are parsed as server-sent events.
+
+uv = vim.uv
+
+-- "http://host:port" -> host, port
+parse_url = (url) ->
+    host, port = url\match('^%a+://%[?([%w%.:%-]-)%]?:(%d+)')
+    host = host or url\match('^%a+://([^/:]+)')
+    host, tonumber(port) or 80
+
+-- Pull complete chunks off `raw`; returns decoded data, rest, finished
+dechunk = (raw) ->
+    out = {}
+    while true
+        eol = raw\find('\r\n', 1, true)
+        break unless eol
+        size = tonumber(raw\sub(1, eol - 1)\match('^%x+'), 16)
+        return table.concat(out), '', true if size == nil or size == 0
+        break if #raw < eol + 1 + size + 2
+        table.insert(out, raw\sub(eol + 2, eol + 1 + size))
+        raw = raw\sub(eol + size + 4)
+    table.concat(out), raw, false
+
+-- opts:
+--   sock | url         Unix socket path, or http://host:port
+--   method, path, body
+--   timeout            ms; 0/nil = none
+--   on_event(obj)      streaming: called (in a luv callback) per SSE data
+--                      object of a 200 response; return true to stop early
+-- callback(err, status, body) runs once, on the main loop. body is the
+-- raw (de-chunked) body for non-streaming or non-200 responses.
+-- Returns abort(), which fails the request with "Cancelled".
+request = (opts, callback) ->
+    local handle, timer
+    done = false
+
+    finish = (err, status, body) ->
+        return if done
+        done = true
+        if timer
+            timer\stop()
+            timer\close() unless timer\is_closing()
+        if handle and not handle\is_closing()
+            handle\close()
+        vim.schedule(-> callback(err, status, body))
+
+    status = nil
+    chunked = false
+    raw = ''        -- bytes not yet parsed (headers / chunk framing)
+    body = {}       -- decoded body pieces (non-streaming)
+    events = ''     -- decoded SSE text not yet split into events
+
+    -- Handle decoded body bytes; returns true (plus an error if on_event
+    -- failed) when the stream should end here
+    on_body = (data) ->
+        return false if data == ''
+        unless opts.on_event and status == 200
+            table.insert(body, data)
+            return false
+        events ..= data
+        while true
+            sep = events\find('\n\n', 1, true)
+            break unless sep
+            block = events\sub(1, sep - 1)
+            events = events\sub(sep + 2)
+            for line in block\gmatch('[^\n]+')
+                json = line\match('^data: ?(.*)')
+                if json and json ~= '[DONE]'
+                    ok, obj = pcall(vim.json.decode, json)
+                    if ok and type(obj) == 'table'
+                        -- An error here would otherwise leave the request
+                        -- hanging until its timeout
+                        cb_ok, stop = pcall(opts.on_event, obj)
+                        return true, stop unless cb_ok
+                        return true if stop
+        false
+
+    on_read = (err, data) ->
+        return if done
+        if err
+            return finish("Read: #{err}", status)
+        unless data
+            return finish("Connection closed before response") unless status
+            return finish(nil, status, table.concat(body))
+
+        raw ..= data
+        unless status
+            head_end = raw\find('\r\n\r\n', 1, true)
+            return unless head_end
+            head = raw\sub(1, head_end - 1)
+            raw = raw\sub(head_end + 4)
+            status = tonumber(head\match('^HTTP/%d%.?%d? (%d+)'))
+            return finish("Bad HTTP response") unless status
+            chunked = head\lower()\find('\ntransfer%-encoding:%s*chunked') ~= nil
+
+        local decoded, finished
+        if chunked
+            decoded, raw, finished = dechunk(raw)
+        else
+            decoded, raw = raw, ''
+        stopped, cb_err = on_body(decoded)
+        if stopped or finished
+            finish(cb_err and "on_event: #{cb_err}", status, table.concat(body))
+
+    on_connect = (err) ->
+        return if done
+        if err
+            return finish("Connect: #{err}")
+        body_str = opts.body or ''
+        head = table.concat({
+            "#{opts.method or 'GET'} #{opts.path} HTTP/1.1"
+            "Host: localhost"
+            "Connection: close"
+            "Content-Type: application/json"
+            "Content-Length: #{#body_str}"
+            '', ''
+        }, '\r\n')
+        handle\write(head .. body_str, (werr) ->
+            finish("Write: #{werr}") if werr
+        )
+        handle\read_start(on_read)
+
+    if opts.timeout and opts.timeout > 0
+        timer = uv.new_timer()
+        timer\start(opts.timeout, 0, -> finish("Timed out after #{opts.timeout}ms"))
+
+    if opts.sock
+        handle = uv.new_pipe(false)
+        handle\connect(opts.sock, on_connect)
+    else
+        host, port = parse_url(opts.url)
+        uv.getaddrinfo(host, tostring(port), { socktype: 'stream' }, (gerr, addrs) ->
+            return if done
+            return finish("Connect: #{gerr or 'no address for ' .. host}") unless addrs and addrs[1]
+            handle = uv.new_tcp()
+            handle\connect(addrs[1].addr, addrs[1].port, on_connect)
+        )
+
+    -> finish("Cancelled")
+
+export default {
+    :request
+    :parse_url
+    :dechunk
+}

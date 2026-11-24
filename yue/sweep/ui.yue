@@ -146,12 +146,12 @@ export default class GhostText
             buf_line = (window_start - 1) + (hunk.old_start - 1) + i
             if buf_line >= 0 and buf_line < total_lines
                 line_text = api.nvim_buf_get_lines(bufnr, buf_line, buf_line + 1, false)[1] or ''
-                id = api.nvim_buf_set_extmark(bufnr, @ns_id, buf_line, 0, {
-                    end_row: buf_line
-                    end_col: #line_text
-                    hl_group: 'SweepDeletion'
-                    hl_mode: 'combine'
-                })
+                -- A zero-width range would be invisible on an empty line
+                opts = if #line_text > 0
+                    { end_row: buf_line, end_col: #line_text, hl_group: 'SweepDeletion', hl_mode: 'combine' }
+                else
+                    { line_hl_group: 'SweepDeletion' }
+                id = api.nvim_buf_set_extmark(bufnr, @ns_id, buf_line, 0, opts)
                 table.insert(@extmark_ids, id)
 
     -- Show the adds as virtual lines where they would end up: below the

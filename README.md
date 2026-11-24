@@ -7,40 +7,44 @@ AI-powered code completions for Neovim using the
 [sweep-next-edit](https://blog.sweep.dev/posts/oss-next-edit) model.
 Inspired by [cursortab.nvim](https://github.com/postsinterthesis/cursortab.nvim).
 
-Runs a local Python proxy (`sweep_proxy.py`) that loads the model via
-`llama-cpp-python` and communicates with Neovim over a Unix domain socket
-(with HTTP fallback).
+Neovim talks directly to a local
+[llama.cpp](https://github.com/ggml-org/llama.cpp) `llama-server` over a Unix
+domain socket. The plugin starts the server when needed and it stops itself
+when idle.
 
 ## Why sweep.nvim
 
 cursortab.nvim routes requests through a compiled Go server over HTTP before
-they reach the model. sweep.nvim eliminates that middleman:
+they reach the model. sweep.nvim has no middleman:
 
 ```
 cursortab:  Neovim → HTTP → Go server → HTTP → llama.cpp server → model
-sweep.nvim: Neovim → Unix socket → Python proxy → model
+sweep.nvim: Neovim → Unix socket → llama-server → model
 ```
 
-The Unix domain socket skips all TCP stack overhead and HTTP parsing.
-Combined with `llama-cpp-python` running the model in-process (with flash
-attention and full GPU KV-cache offload enabled by default), round-trip
-latency is significantly lower — particularly noticeable on short FIM
-completions where the model is fast but transport overhead dominates.
-
-The proxy is also a single shared process — all open Neovim instances connect
-to the same socket, so the model is only loaded into memory once regardless
-of how many editors are running.
-
-sweep.nvim also requires no extra language runtime to build: no Go toolchain,
-just Python.
+- **One shared server** — every open Neovim uses the same socket, so the model
+  is loaded once. It exits after `provider.idle_timeout` seconds without
+  requests and the next request starts it again.
+- **Fast edits** — an edit prediction rewrites a window of code that is
+  mostly unchanged, so the server drafts tokens from the prompt and verifies
+  them in batches (`--spec-type ngram-simple`). On an M1 Pro a ~2k token edit
+  prompt takes ~0.65 s instead of ~2.7 s, with identical output.
+- **Two slots** — FIM and edit prompts each keep their KV cache, so switching
+  between insert and normal mode does not re-read the prompt.
+- **Streaming** — FIM output stops as soon as it has enough lines, and a
+  superseded request is aborted on the server right away.
+- **No extra runtime** — no Python, Go or Node: just `llama-server`.
 
 ## Features
 
 - **FIM completions** — inline ghost text at the cursor in insert mode
 - **Edit predictions** — next-edit suggestions in normal mode, shown as
-  virtual-text diffs
-- **Dual transport** — Unix socket (low latency) with automatic HTTP fallback
-- **Smart debounce** — stale responses are discarded when new input arrives
+  virtual-text diffs. Only changes within `provider.edit_proximity` lines of
+  the cursor are shown, and output cut off by the token limit never turns
+  into a deletion
+- **Cancellation** — typing, moving to another line, switching mode or
+  leaving the buffer aborts the request in flight, and stale responses are
+  discarded
 - **Blink.cmp integration** — hides ghost text while the completion menu is open
 - **Cache** — avoids duplicate requests for the same context
 - **Edit-history context** — recent diffs are fed to the model for better
@@ -50,8 +54,9 @@ just Python.
 ## Requirements
 
 - Neovim 0.10+
-- Python 3.10+ with `llama-cpp-python`, `fastapi`, `uvicorn`
-- The `sweep-next-edit` GGUF model (see [Model](#model) below)
+- [llama.cpp](https://github.com/ggml-org/llama.cpp) `llama-server`
+  (e.g. `brew install llama.cpp`, or a release build for your GPU)
+- `curl` (used by the server wrapper to check for idleness)
 - [YueScript](https://github.com/IppClub/YueScript) — only if rebuilding from source
 
 ## Installation
@@ -73,77 +78,40 @@ Compiled Lua is included in the repo — no build step required:
 If you want to rebuild from the [YueScript](https://github.com/IppClub/YueScript)
 sources, add `build = "make"`.
 
-### 3. Set up the proxy
+### 2. Model
 
-Install Python dependencies:
+By default `llama-server` downloads
+[sweepai/sweep-next-edit-1.5B](https://huggingface.co/sweepai/sweep-next-edit-1.5B)
+(`sweep-next-edit-1.5b.q8_0.v2.gguf`, ~1.6 GB) into its cache on first start
+(`LLAMA_CACHE`, default `~/.cache/llama.cpp`). To use a local file instead:
 
-```bash
-pip install llama-cpp-python fastapi uvicorn
+```lua
+require("sweep").setup({ provider = { model_path = "~/models/sweep-next-edit-1.5b.q8_0.v2.gguf" } })
 ```
 
-#### Model
+### 3. Server
 
-Download the GGUF model into `proxy/models/`:
+Nothing to do: the first completion request (or `VeryLazy`) starts
+`bin/sweep-server`, which runs `llama-server` on
+`$XDG_RUNTIME_DIR/sweep-server.sock` (or `/tmp/sweep-server-<uid>.sock`). A lock
+next to the socket keeps it to one server per user. Its output goes to
+`stdpath("log")/sweep-server.log`.
+
+Extra `llama-server` arguments go in `provider.server_args`, and environment
+variables in `provider.env` (e.g. `{ VK_DRIVER_FILES = "..." }` to pick a
+Vulkan driver).
+
+To run the server yourself, set `provider.url`; sweep.nvim then never starts
+or stops it:
 
 ```bash
-mkdir -p proxy/models
-# Example with huggingface-cli:
-huggingface-cli download \
-    sweepai/sweep-next-edit \
-    sweep-next-edit-1.5b.q8_0.v2.gguf \
-    --local-dir proxy/models
+llama-server -hfr sweepai/sweep-next-edit-1.5B -hff sweep-next-edit-1.5b.q8_0.v2.gguf \
+    -c 16384 -np 2 -ngl 99 -fa on --spec-type ngram-simple --cache-ram 512 \
+    --port 8012
 ```
 
-#### Run the proxy
-
-The plugin will automatically start the proxy when Neovim loads
-(`provider.auto_start = true` by default), so you don't need to start it
-manually or set up a system service. Just make sure `provider.proxy_script`
-points to the correct path (defaults to the plugin's own `proxy/sweep_proxy.py`
-inside the lazy data directory). Set `provider.model_path` to the absolute path
-of your GGUF model file; if unset the proxy looks for it relative to the script.
-
-The proxy is a single persistent process shared across all Neovim instances.
-If it is already running when a second instance starts, the new instance
-connects to the existing socket rather than spawning a duplicate.
-
-If you prefer to manage the proxy yourself, you can disable auto-start and
-run it manually:
-
-```bash
-python3 proxy/sweep_proxy.py
-```
-
-The proxy listens on:
-- Unix socket: `$XDG_RUNTIME_DIR/sweep.sock` (or `/tmp/sweep-<uid>.sock`)
-- HTTP: `http://127.0.0.1:5555`
-
-Edit predictions use prompt-lookup speculative decoding: the model mostly
-copies the code window back, so tokens drafted from the prompt are verified
-in batches (about 2.4x faster edits, identical output). Set
-`SWEEP_PROMPT_LOOKUP` to the number of drafted tokens (default `10`), or `0`
-to disable it, e.g. through `provider.env`.
-
-#### System service (optional)
-
-If you want the proxy to start at login independently of Neovim, service
-templates are provided.
-
-**Linux (systemd):**
-
-```bash
-cp proxy/sweep-proxy.service ~/.config/systemd/user/sweep-proxy.service
-# Edit WorkingDirectory and ExecStart to match your paths
-systemctl --user enable --now sweep-proxy
-```
-
-**macOS (LaunchAgent):**
-
-```bash
-cp proxy/com.user.sweep-proxy.plist.template \
-    ~/Library/LaunchAgents/com.user.sweep-proxy.plist
-# Edit paths inside the plist to match your environment
-launchctl load ~/Library/LaunchAgents/com.user.sweep-proxy.plist
+```lua
+require("sweep").setup({ provider = { url = "http://127.0.0.1:8012" } })
 ```
 
 ## Configuration
@@ -153,58 +121,47 @@ All options and their defaults:
 ```lua
 require("sweep").setup({
     enabled = true,
-    log_level = "warn",  -- "debug" | "info" | "warn" | "error"
+    log_level = "info",  -- "debug" | "info" | "warn" | "error"
 
+    -- accept and sweep pass the key through when there is nothing to accept;
+    -- <Esc> in normal mode rejects a visible prediction
     keymaps = {
-        accept         = "<Tab>",   -- accept FIM completion
-        sweep          = "<Tab>",   -- accept edit prediction
-        partial_accept = false,     -- accept word-by-word (key or false)
-        reject         = false,     -- explicit reject (ESC always rejects)
-        trigger        = false,     -- manual trigger (false = auto only)
-    },
-
-    ui = {
-        completions = {
-            addition_style = "highlight",  -- "highlight" | "inline"
-            fg_opacity     = 1.0,
-        },
-        jump = {
-            enabled      = false,   -- cursor-jump indicator
-            symbol       = " ",
-            text         = " TAB ",
-            show_distance = true,
-        },
+        accept  = "<Tab>",   -- accept FIM completion (insert mode, or false)
+        sweep   = "<Tab>",   -- accept edit prediction (normal mode, or false)
+        trigger = false,     -- manual trigger (false = auto only)
     },
 
     behavior = {
-        idle_completion_delay   = 50,    -- ms after typing stops
-        text_change_debounce    = 50,    -- ms debounce for TextChangedI
-        edit_prediction_delay   = 1000,  -- ms in normal mode before edit prediction
-        ignore_filetypes        = { ... },
-        ignore_gitignored       = false,
-        enabled_modes           = { "i", "n" },
-        min_line_length         = 0,
-        max_file_lines          = 10000,
-        hide_on_cursor_move     = true,
+        text_change_debounce  = 50,    -- ms debounce for TextChangedI
+        edit_prediction_delay = 1000,  -- ms in normal mode before edit prediction
+        ignore_filetypes      = { ... },
+        enabled_modes         = { "i", "n" },
+        max_file_lines        = 10000,
+        hide_on_cursor_move   = true,
     },
 
     provider = {
-        url                = "http://127.0.0.1:5555",
+        url                = nil,      -- nil = managed server on a Unix socket;
+                                       -- "http://host:port" = external server
         mode               = "auto",   -- "auto" | "fim" | "edit"
-        max_tokens         = 512,
+        max_tokens         = 512,      -- min edit budget (grows with the window)
         fim_max_tokens     = 128,
         max_fim_lines      = 4,
+        edit_proximity     = 8,        -- keep edits within this many lines of the cursor
         temperature        = 0.0,
         top_p              = 1.0,
         top_k              = 50,
         repeat_penalty     = 1.0,
-        completion_timeout = 5000,     -- ms
-        auto_start         = true,
-        proxy_script       = vim.fn.stdpath("data") .. "/lazy/sweep.nvim/proxy/sweep_proxy.py",
-        model_path         = nil,      -- Path to GGUF model (nil = proxy default)
-        env                = nil,      -- Extra environment for the proxy, e.g.
-                                       -- { VK_DRIVER_FILES = "..." } to pick a
-                                       -- Vulkan driver
+        completion_timeout = 5000,     -- ms, FIM
+        edit_timeout       = 15000,    -- ms, edit
+        auto_start         = true,     -- start the managed server when needed
+        server_cmd         = "llama-server",
+        server_args        = {},       -- extra llama-server arguments
+        model_path         = nil,      -- GGUF path (nil = download from Hugging Face)
+        idle_timeout       = 900,      -- s without requests before the server exits (0 = never)
+        start_timeout      = 300000,   -- ms to wait for start (first run downloads the model)
+        socket             = nil,      -- socket path override
+        env                = nil,      -- extra environment for llama-server
     },
 
     context = {
@@ -212,12 +169,10 @@ require("sweep").setup({
         max_edit_history   = 6,    -- recent edit hunks in prompt
         max_context_files  = 3,    -- recently visited files for context
         context_file_lines = 60,   -- max lines per context file
-        initial_file_lines = 300,  -- lines from original file in prompt
     },
 
     blink = {
-        enabled    = true,
-        ghost_text = true,
+        enabled = true,  -- hide ghost text while the blink.cmp menu is open
     },
 })
 ```
@@ -240,9 +195,6 @@ require("sweep").setup({
 | `SweepCompletion`   | `Comment`     | FIM ghost text               |
 | `SweepAddition`     | `DiffAdd`     | Added lines in edit preview  |
 | `SweepDeletion`     | `DiffDelete`  | Removed lines in edit preview|
-| `SweepModification` | `DiffText`    | Changed lines in edit preview|
-| `SweepJumpSymbol`   | `Identifier`  | Jump indicator symbol        |
-| `SweepJumpText`     | (custom)      | Jump indicator label         |
 
 ## Lualine component
 
@@ -259,24 +211,59 @@ lualine.setup({
 })
 ```
 
-Shows `● SW` when the proxy is connected, `○ SW` when offline, and a spinner
+Shows `● SW` when the server is reachable, `○ SW` when offline, and a spinner
 while a request is in flight.
 
 ## Architecture
 
 ```
-Neovim                         proxy/sweep_proxy.py
-  │                                    │
-  │── sweep.client (Unix socket) ─────▶│ llama-cpp-python
-  │   (fallback: HTTP via curl)        │   sweep-next-edit model
-  │                                    │
-  │◀─ FIM text / updated lines ────────│
+Neovim (any number)                 bin/sweep-server (one per user)
+  │                                    │  lock, idle shutdown
+  │── sweep.http (Unix socket) ───────▶│ llama-server /completion (streamed)
+  │   POST /completion, SSE            │   sweep-next-edit model, 2 slots,
+  │                                    │   prompt-lookup speculation
+  │◀─ FIM text / rewritten window ─────│
   │
-  ├── sweep.ui       ghost text / virtual diff
-  ├── sweep.buffer   context snapshot & diff
-  ├── sweep.cache    LRU result cache
-  ├── sweep.tracker  edit history & recent files
-  └── sweep.config   defaults & highlight setup
+  ├── sweep.server       start / health of the managed server
+  ├── sweep.client       prompts, streaming, cancellation
+  ├── sweep.postprocess  FIM trimming, edit hunks near the cursor
+  ├── sweep.ui           ghost text / virtual diff
+  ├── sweep.buffer       context snapshot & diff
+  ├── sweep.cache        LRU result cache
+  ├── sweep.tracker      edit history & recent files
+  └── sweep.config       defaults & highlight setup
+```
+
+## Troubleshooting
+
+- `:SweepStatus` shows the server endpoint and whether it is reachable.
+- The managed server logs to `stdpath("log")/sweep-server.log`
+  (e.g. `~/.local/state/nvim/logs/sweep-server.log`).
+- With `log_level = "debug"` every response logs its timings, e.g.
+  `edit: prompt 485 tok 574ms, gen 94 tok 751ms, draft 47/144`.
+- Slow completions usually mean `llama-server` runs on the CPU: use a build
+  with GPU support (Metal on macOS via Homebrew, Vulkan or CUDA on Linux).
+
+## Upgrading from the Python proxy
+
+Earlier versions ran a Python proxy (`proxy/sweep_proxy.py`, llama-cpp-python)
+on `/tmp/sweep-<uid>.sock` and port 5555. It is gone:
+
+- Install `llama-server` (see [Requirements](#requirements)).
+- Remove `provider.proxy_script` from your config. `provider.model_path` and
+  `provider.env` still work and are passed to `llama-server`.
+- A proxy that is still running exits on its own after 15 minutes idle, or
+  kill it. Remove any systemd or launchd unit you installed for it.
+
+## Development
+
+Sources are [YueScript](https://github.com/IppClub/YueScript) in `yue/`; the
+compiled Lua in `lua/` is committed. Rebuild with `make` and run the headless
+tests:
+
+```bash
+make
+for t in tests/*_test.lua; do nvim --headless --clean --cmd 'set rtp^=.' -l "$t"; done
 ```
 
 ## License

@@ -1,101 +1,31 @@
--- Sweep Proxy Client
--- Transport: Unix socket (preferred) → HTTP via vim.net.request (fallback)
--- Supports both FIM (inline completion) and edit (next-edit prediction) modes
+-- Sweep client: builds prompts, streams completions from llama-server
+-- (/completion, server-sent events) and post-processes them.
+-- Supports FIM (inline completion) and edit (next-edit prediction) modes.
 
-uv = vim.uv
+http = require('sweep.http')
+post = require('sweep.postprocess')
+Server = require('sweep.server')
 
--- Generate unique instance ID for this Neovim session
-INSTANCE_ID = "nvim_#{vim.fn.getpid()}_#{vim.uv.hrtime()}"
-
--- Stop tokens per mode (match original sweep.nvim)
 FIM_STOP = {
     '<|endoftext|>', '<|file_sep|>', '</s>',
     '<|fim_prefix|>', '<|fim_suffix|>', '<|fim_middle|>'
 }
 EDIT_STOP = {'<|file_sep|>', '</s>'}
 
--- vim.net.request has no timeout, so cancel it from a timer.
--- callback(err, body) runs on the main loop.
-http_request = (method, url, opts, timeout, callback) ->
-    done = false
-    timer = vim.uv.new_timer()
-
-    finish = (err, body) ->
-        return if done
-        done = true
-        timer\stop()
-        timer\close() unless timer\is_closing()
-        vim.schedule(-> callback(err, body))
-
-    req = vim.net.request(method, url, vim.tbl_extend('force', { retry: 0 }, opts),
-        (err, res) -> finish(err, res and res.body)
-    )
-
-    timer\start(timeout, 0, ->
-        return if done
-        req.close()
-        finish("timed out after #{timeout}ms")
-    )
-
--- Errors that retrying can't fix: the request was too slow, aborted, or
--- the connection was deliberately dropped
-NO_RETRY_PATTERNS = { '[Tt]imed out', '^[Cc]ancelled', '^[Ss]uperseded', '^Disconnected' }
-
-is_retryable = (err) ->
-    msg = tostring(err)
-    for pat in *NO_RETRY_PATTERNS
-        return false if msg\find(pat)
-    true
-
-stop_close = (timer) ->
-    return unless timer
-    timer\stop()
-    timer\close() unless timer\is_closing()
+-- Pull a readable message out of an error response body
+error_message = (status, body) ->
+    ok, obj = pcall(vim.json.decode, body or '')
+    if ok and type(obj) == 'table' and type(obj.error) == 'table'
+        return "HTTP #{status}: #{obj.error.message}"
+    "HTTP #{status}"
 
 export default class SweepClient
-    config: nil
-    -- Unix socket transport
-    pipe: nil
-    connected: false
-    connecting: false
-    read_buffer: ''
-    sock_path: nil
-    -- Callbacks waiting for an in-progress connect
-    connect_waiters: {}
-    -- In-flight socket requests: id -> { callback, timer }. Requests carry
-    -- an id the proxy echoes back; replies without one (older proxies,
-    -- which answer in order) go to the oldest request in pending_order.
-    pending: {}
-    pending_order: {}
-    next_id: 0
-    -- State
-    transport: nil  -- 'socket' | 'http' | nil
-    retry_count: 0
-    max_retries: 3
-
     new: (config) =>
         @config = config
-        @pipe = nil
-        @connected = false
-        @connecting = false
-        @read_buffer = ''
-        @connect_waiters = {}
-        @pending = {}
-        @pending_order = {}
-        @next_id = 0
-        @retry_count = 0
-        @max_retries = 3
-        @transport = nil
-
-        -- Determine socket path
-        xdg = os.getenv('XDG_RUNTIME_DIR')
-        if xdg
-            @sock_path = "#{xdg}/sweep.sock"
-        else
-            ok, uid = pcall(vim.uv.getuid)
-            unless ok
-                uid = vim.fn.system('id -u')\gsub('%s+', '')
-            @sock_path = "/tmp/sweep-#{uid}.sock"
+        @server = Server(config)
+        @connected = false  -- last request reached the server
+        @abort = nil        -- aborts the in-flight completion
+        @generation = 0     -- bumped by cancel(); stale work checks it
 
     -- ---------------------------------------------------------------
     -- Logging
@@ -108,377 +38,147 @@ export default class SweepClient
     is_debug: () => @config and @config.log_level == 'debug'
 
     -- ---------------------------------------------------------------
-    -- Unix socket transport
+    -- Connection
     -- ---------------------------------------------------------------
 
-    -- Run every callback queued during a connect attempt
-    _flush_waiters: (ok, err) =>
-        waiters = @connect_waiters
-        @connect_waiters = {}
-        for cb in *waiters
-            cb(ok, err)
-
-    -- Complete one in-flight request; late or unknown ids are ignored
-    _resolve: (id, response, err) =>
-        entry = @pending[id]
-        return unless entry
-        @pending[id] = nil
-        for i, pid in ipairs(@pending_order)
-            if pid == id
-                table.remove(@pending_order, i)
-                break
-        stop_close(entry.timer)
-        vim.schedule(-> entry.callback(response, err))
-
-    -- Fail every in-flight request (connection lost or dropped)
-    _fail_pending: (err) =>
-        ids = @pending_order
-        @pending_order = {}
-        pending = @pending
-        @pending = {}
-        for id in *ids
-            entry = pending[id]
-            if entry
-                stop_close(entry.timer)
-                vim.schedule(-> entry.callback(nil, err))
-
-    _on_message: (msg) =>
-        ok, response = pcall(vim.json.decode, msg)
-        id = ok and type(response) == 'table' and response.id or nil
-        if id == nil or id == vim.NIL
-            -- No id: reply to the oldest request (proxies answer in order)
-            id = @pending_order[1]
-        return unless id
-        if ok
-            @_resolve(id, response, nil)
-        else
-            @_resolve(id, nil, "JSON parse error")
-
-    socket_connect: (callback) =>
-        return callback(true) if @connected
-
-        -- Queue behind a connect already in progress instead of dropping
-        -- the callback (which left the request unanswered forever)
-        table.insert(@connect_waiters, callback)
-        return if @connecting
-
-        unless uv.fs_stat(@sock_path)
-            @_flush_waiters(false, "Socket not found: #{@sock_path}")
-            return
-
-        @connecting = true
-        pipe = uv.new_pipe(false)
-        @pipe = pipe
-        self = @
-
-        pipe\connect(@sock_path, (err) ->
-            -- Superseded by disconnect() while connecting
-            if self.pipe ~= pipe
-                pipe\close() unless pipe\is_closing()
-                return
-            self.connecting = false
-            if err
-                pipe\close() unless pipe\is_closing()
-                self.pipe = nil
-                self.connected = false
-                vim.schedule(-> self\_flush_waiters(false, "Socket connect: #{err}"))
-            else
-                self.connected = true
-                self.transport = 'socket'
-                self.read_buffer = ''
-                pipe\read_start((read_err, data) ->
-                    return unless self.pipe == pipe
-                    if read_err or not data
-                        self.connected = false
-                        self.transport = nil
-                        pipe\close() unless pipe\is_closing()
-                        self.pipe = nil
-                        self.read_buffer = ''
-                        self\_fail_pending("Connection lost")
-                        return
-
-                    self.read_buffer ..= data
-                    while true
-                        nl = self.read_buffer\find('\n', 1, true)
-                        break unless nl
-                        msg = self.read_buffer\sub(1, nl - 1)
-                        self.read_buffer = self.read_buffer\sub(nl + 1)
-                        self\_on_message(msg)
-                )
-                vim.schedule(->
-                    self\log("Connected via Unix socket")
-                    self\_flush_waiters(true)
-                )
-        )
-
-    -- callback(response, err) runs on the main loop. timeout (ms) fails the
-    -- request and drops the connection, so a late reply can't be paired
-    -- with a later request and the proxy aborts the generation.
-    socket_send: (request, callback, timeout) =>
-        unless @connected and @pipe
-            callback(nil, "Not connected")
-            return
-
-        @next_id += 1
-        id = @next_id
-        request.id = id
-
-        timer = nil
-        if timeout and timeout > 0
-            timer = uv.new_timer()
-            timer\start(timeout, 0, ->
-                vim.schedule(->
-                    return unless @pending[id]
-                    @_resolve(id, nil, "Timed out after #{timeout}ms")
-                    @disconnect()
-                )
-            )
-
-        @pending[id] = { callback: callback, timer: timer }
-        table.insert(@pending_order, id)
-
-        data = vim.json.encode(request) .. '\n'
-        ok, err = pcall(-> @pipe\write(data))
-        unless ok
-            @_resolve(id, nil, "Write failed: #{err}")
-            @disconnect()
-
-    -- ---------------------------------------------------------------
-    -- HTTP transport (fallback)
-    -- ---------------------------------------------------------------
-    http_send: (request, callback, timeout) =>
-        url = "#{@config.provider.url}/v1/completions"
-        -- Build request body with all fields
-        body_dict = {
-            prompt: request.prompt
-            max_tokens: request.max_tokens
-            temperature: request.temperature
-            top_p: request.top_p
-            top_k: request.top_k
-            repeat_penalty: request.repeat_penalty
-            stop: request.stop
-            stream: false
-            mode: request.mode
-            instance_id: request.instance_id
-            timeout: request.timeout
-        }
-        -- Add mode-specific fields
-        if request.mode == 'fim'
-            body_dict.suffix_lines = request.suffix_lines
-            body_dict.max_lines = request.max_lines
-        else
-            body_dict.current_lines = request.current_lines
-            body_dict.cursor_offset = request.cursor_offset
-            body_dict.proximity = request.proximity
-
-        body = vim.json.encode(body_dict)
-
-        -- Use request-specific timeout or config default
-        timeout = timeout or request.timeout or @config.provider.completion_timeout or 5000
-
-        http_request('POST', url, {
-            body: body
-            headers: { ['Content-Type']: 'application/json' }
-        }, timeout, (err, out) ->
-            if err
-                callback(nil, "HTTP failed: #{err}")
-                return
-
-            ok, response = pcall(vim.json.decode, out)
-            unless ok
-                callback(nil, "HTTP JSON parse error")
-                return
-
-            -- FastAPI reports errors as { detail: ... }
-            if response.error or response.detail
-                callback(nil, response.error or response.detail)
-                return
-
-            -- Return response as-is for unified handling
-            callback(response, nil)
-        )
-
-    -- ---------------------------------------------------------------
-    -- Unified send
-    -- ---------------------------------------------------------------
-    send: (request, callback, timeout) =>
-        -- If on HTTP fallback, periodically retry socket
-        if @transport == 'http'
-            @_http_request_count = (@_http_request_count or 0) + 1
-            if @_http_request_count >= 20
-                @_http_request_count = 0
-                @transport = nil  -- Allow socket retry
-            else
-                @http_send(request, callback, timeout)
-                return
-
-        if @connected and @transport == 'socket'
-            @socket_send(request, callback, timeout)
-            return
-
-        @socket_connect((ok, err) ->
-            if ok
-                @socket_send(request, callback, timeout)
-            elseif request.type == 'health'
-                -- No HTTP equivalent of a socket health request
-                callback(nil, err)
-            else
-                @log("Socket unavailable (#{err}), using HTTP fallback")
-                @transport = 'http'
-                @_http_request_count = 0
-                @http_send(request, callback, timeout)
-        )
-
-    -- Ask the proxy to abort this instance's running generation (its
-    -- request then fails with "cancelled"). Socket only; over HTTP the
-    -- next request from this instance supersedes the old one instead.
+    -- Abort the in-flight completion; its callback gets "Cancelled".
+    -- Closing the connection makes llama-server stop generating.
     cancel: () =>
-        return unless @connected and @transport == 'socket' and next(@pending)
-        -- Registered like any request so in-order replies stay paired
-        -- (older proxies answer it with an "Unknown type" error)
-        @socket_send({ type: 'cancel', instance_id: INSTANCE_ID }, (->), nil)
+        @generation += 1
+        if @abort
+            abort = @abort
+            @abort = nil
+            abort()
 
-    disconnect: () =>
-        @connecting = false
-        if @pipe and not @pipe\is_closing()
-            @pipe\read_stop() if @connected
-            @pipe\close()
-        @pipe = nil
-        @connected = false
-        @transport = nil
-        @read_buffer = ''
-        -- Answer everything still waiting so callers don't stay "processing"
-        @_fail_pending("Disconnected")
-        @_flush_waiters(false, "Disconnected")
+    disconnect: () => @cancel()
+
+    -- Make sure the server is up (starting it if managed) and report
+    health_check: (callback) =>
+        @server\ensure((ok, err) ->
+            @connected = ok
+            if ok
+                @log("llama-server ready (#{@server\describe()})")
+            else
+                @log(err, vim.log.levels.WARN)
+            callback(ok, err) if callback
+        )
 
     -- ---------------------------------------------------------------
-    -- Public API
+    -- Completion
     -- ---------------------------------------------------------------
-    health_check: () =>
-        if @transport == 'http' or not uv.fs_stat(@sock_path)
-            http_request('GET', "#{@config.provider.url}/health", {}, 2000, (err) ->
-                if err
-                    @log("Sweep proxy not responding", vim.log.levels.WARN)
-                else
-                    @log("Sweep proxy is healthy (HTTP)", vim.log.levels.INFO)
-                    @transport = 'http'
-            )
-        else
-            @send({ type: 'health' }, ((response, err) ->
-                if err
-                    @log("Proxy not responding: #{err}", vim.log.levels.WARN)
-                elseif response and response.status == 'ok'
-                    @log("Sweep proxy is healthy (socket)", vim.log.levels.INFO)
-            ), 5000)
 
-    -- FIM completion: inline text at cursor position
-    -- Returns a string completion via callback(text, err)
+    -- callback(result, err): FIM gives a string, edit a list of lines
+    -- (the window with nearby changes applied); nil, nil = no suggestion
     request_completion: (mode, context, tracker, callback) =>
         return callback(nil, "No context") unless context and callback
 
         mode = mode or 'fim'
         provider = @config.provider
 
-        local prompt, stop, max_tokens
+        local prompt, stop, n_predict, timeout
         if mode == 'fim'
             prompt = @build_fim_prompt(context)
             stop = FIM_STOP
-            max_tokens = provider.fim_max_tokens or 128
+            n_predict = provider.fim_max_tokens or 128
+            timeout = provider.completion_timeout or 5000
         else
             prompt = @build_edit_prompt(context, tracker)
             stop = EDIT_STOP
-            max_tokens = provider.max_tokens or 512
+            -- The output repeats the whole window: never cut it short
+            -- (~3 chars per token, plus room for added lines)
+            window_chars = #table.concat(context.current_lines or {}, '\n')
+            n_predict = math.max(provider.max_tokens or 512, math.ceil(window_chars / 3) + 64)
+            timeout = provider.edit_timeout or 15000
 
         unless prompt
-            -- Edit mode returns nil when there are no changes - this is expected
-            if mode == 'edit'
-                callback(nil, nil)  -- Silent no-op
-            else
-                callback(nil, "Failed to build prompt")
-            return
+            -- Edit mode returns nil when there is no edit signal
+            return callback(nil, if mode == 'edit' then nil else "Failed to build prompt")
 
-        @log("Requesting #{mode} completion (#{@transport or 'auto'}, prompt #{#prompt} chars)")
-
-        timeout = if mode == 'edit' then 15000 else provider.completion_timeout or 5000
-
-        @log("Sending params: temp=#{provider.temperature}, top_p=#{provider.top_p}, top_k=#{provider.top_k}, penalty=#{provider.repeat_penalty}")
-
-        -- Prepare mode-specific parameters
-        suffix_lines = nil
-        max_lines_param = nil
-        current_lines_param = nil
-        cursor_offset_param = nil
-        proximity_param = nil
-
-        if mode == 'fim'
-            suffix_lines = @get_suffix_lines(context)
-            max_lines_param = provider.max_fim_lines or 21
-        else
-            current_lines_param = context.current_lines
-            cursor_offset_param = context.cursor_offset
-            proximity_param = 8
-
-        @send({
-            type: 'completion'
-            instance_id: INSTANCE_ID
-            mode: mode
+        body = vim.json.encode({
             prompt: prompt
-            max_tokens: max_tokens
+            n_predict: n_predict
             temperature: provider.temperature
             top_p: provider.top_p
             top_k: provider.top_k
             repeat_penalty: provider.repeat_penalty
             stop: stop
+            stream: true
+            cache_prompt: true
+        })
+
+        -- One request in flight per Neovim: a new one supersedes the old
+        @cancel()
+        @log("Requesting #{mode} completion (prompt #{#prompt} chars)")
+        @_send(mode, body, timeout, context, callback, true)
+
+    _send: (mode, body, timeout, context, callback, may_start) =>
+        generation = @generation
+        max_lines = @config.provider.max_fim_lines or 4
+        next_line = mode == 'fim' and post.next_suffix_line(@get_suffix_lines(context)) or nil
+
+        parts = {}
+        final = nil         -- last event (has stop_type and timings)
+        early = false       -- we stopped the stream ourselves
+        on_event = (obj) ->
+            if obj.error
+                final = obj
+                return true
+            table.insert(parts, obj.content or '')
+            if obj.stop
+                final = obj
+                return true
+            if mode == 'fim' and post.fim_should_stop(table.concat(parts), max_lines, next_line)
+                early = true
+                return true
+            false
+
+        local abort
+        abort = http.request(vim.tbl_extend('force', @server\endpoint(), {
+            method: 'POST'
+            path: '/completion'
+            body: body
             timeout: timeout
-            suffix_lines: suffix_lines
-            max_lines: max_lines_param
-            current_lines: current_lines_param
-            cursor_offset: cursor_offset_param
-            proximity: proximity_param
-        }, ((response, err) ->
-            if err
-                @handle_error(err, mode, context, tracker, callback)
+            on_event: on_event
+        }), (err, status, raw) ->
+            @abort = nil if @abort == abort
+            return callback(nil, 'Cancelled') if generation ~= @generation
+
+            -- Server not running (idle stop, crash) or still loading:
+            -- start it / wait for it, then try once more
+            if may_start and ((err and err\match('^Connect')) or status == 503)
+                @connected = false
+                @server\ensure((ok, serr) ->
+                    return callback(nil, 'Cancelled') if generation ~= @generation
+                    return callback(nil, serr) unless ok
+                    @connected = true
+                    @_send(mode, body, timeout, context, callback, false)
+                )
                 return
 
-            if response and response.error
-                @handle_error(response.error, mode, context, tracker, callback)
-                return
+            return callback(nil, err) if err
+            @connected = true
+            return callback(nil, error_message(status, raw)) unless status == 200
+            if final and final.error
+                return callback(nil, error_message(final.error.code or status, vim.json.encode(final)))
 
-            @retry_count = 0
+            text = table.concat(parts)
+            truncated = early or (final and final.stop_type == 'limit') or false
+            if @is_debug() and final and final.timings
+                t = final.timings
+                @log(string.format("%s: prompt %d tok %.0fms, gen %d tok %.0fms, draft %s/%s%s",
+                    mode, t.prompt_n or 0, t.prompt_ms or 0, t.predicted_n or 0, t.predicted_ms or 0,
+                    t.draft_n_accepted or '-', t.draft_n or '-', truncated and ' (truncated)' or ''))
 
             if mode == 'fim'
-                text = response and tostring(response.text) or ''
-                if #text > 0
-                    @log("Got #{#text} chars from model (#{mode})")
-                    callback(text, nil)
-                else
-                    callback(nil, nil)
-            else
-                updated_lines = response and response.updated_lines or {}
-                -- Ensure updated_lines is a table of strings
-                @log("Edit response: #{vim.inspect(response)}") if @is_debug()
-                if type(updated_lines) == 'table' and #updated_lines > 0
-                    @log("Got #{#updated_lines} lines from model (#{mode})")
-                    callback(updated_lines, nil)
-                else
-                    -- Normal: the model often has no edit to suggest
-                    @log("Empty edit response from model")
-                    callback(nil, nil)
-        ), timeout)
+                result = post.post_process_fim(text, truncated, @get_suffix_lines(context), max_lines)
+                return callback(#result > 0 and result or nil, nil)
 
-    handle_error: (err, mode, context, tracker, callback) =>
-        if is_retryable(err) and @retry_count < @max_retries
-            @retry_count += 1
-            delay = math.pow(2, @retry_count) * 100
-            @log("Retry #{@retry_count}/#{@max_retries} in #{delay}ms: #{err}")
-            if @transport == 'socket'
-                @disconnect()
-            vim.defer_fn((-> @request_completion(mode, context, tracker, callback)), delay)
-        else
-            if @retry_count > 0
-                @log("Max retries exceeded: #{err}", vim.log.levels.WARN)
-            @retry_count = 0
-            callback(nil, err)
+            proximity = @config.provider.edit_proximity or 8
+            lines = post.post_process_edit(text, truncated, context.current_lines,
+                context.cursor_offset or 0, proximity)
+            callback(lines, nil)
+        )
+        @abort = abort
 
     -- ---------------------------------------------------------------
     -- FIM Prompt: inline completion at cursor
@@ -546,8 +246,9 @@ export default class SweepClient
         else
             has_buffer_changes = true
 
-        -- Note: We allow edit mode to proceed even without diff history
-        -- The model can suggest improvements based on current code context
+        -- Without any edit there is nothing to predict from: the model
+        -- just copies the window back, so skip the request
+        return nil unless has_diff_history or has_buffer_changes
 
         -- 1. Context files from recently visited buffers
         if tracker

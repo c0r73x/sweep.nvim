@@ -1,0 +1,129 @@
+-- Post-processing of raw model output (pure functions, no Neovim state)
+
+-- Special tokens that may leak into the text (stop strings are already
+-- removed by the server)
+strip_special = (text) ->
+    text = text\gsub('<|[%w_]+|>', '')
+    (text\gsub('</s>', ''))
+
+trim = (s) -> s\match('^%s*(.-)%s*$')
+
+-- First non-blank line after the cursor, trimmed
+next_suffix_line = (suffix_lines) ->
+    for line in *(suffix_lines or {})
+        t = trim(line)
+        return t if t ~= ''
+    nil
+
+-- Should a FIM stream stop now? True once it has max_lines lines (the
+-- rest would be cut anyway) or a finished line repeats the line that
+-- follows the cursor (the model is rewriting existing code).
+fim_should_stop = (text, max_lines, next_line) ->
+    lines = vim.split(text, '\n', { plain: true })
+    return true if #lines > max_lines
+    if next_line
+        -- Only finished lines: the last one may still grow
+        for i = 2, #lines - 1
+            return true if trim(lines[i]) == next_line
+    false
+
+-- FIM text is inserted verbatim at the cursor, so leading whitespace is
+-- kept. truncated: generation was cut (token limit or early stop), so the
+-- last line may be partial.
+post_process_fim = (text, truncated, suffix_lines, max_lines=4) ->
+    return '' unless text and text ~= ''
+    text = strip_special(text)
+    lines = vim.split(text, '\n', { plain: true })
+    table.remove(lines) if truncated and #lines > 1
+    while #lines > max_lines
+        table.remove(lines)
+    next_line = next_suffix_line(suffix_lines)
+    if next_line
+        for i = 2, #lines
+            if trim(lines[i]) == next_line
+                lines = [l for l in *lines[1, i - 1]]
+                break
+    (table.concat(lines, '\n')\gsub('%s+$', ''))
+
+-- Hunks between two line lists: { start_a, count_a, start_b, count_b }
+-- (a count of 0 means an insertion/deletion after line start)
+diff_hunks = (a, b) ->
+    return {} if #a == 0 and #b == 0
+    sa = #a > 0 and table.concat(a, '\n') .. '\n' or ''
+    sb = #b > 0 and table.concat(b, '\n') .. '\n' or ''
+    vim.diff(sa, sb, { result_type: 'indices', algorithm: 'histogram' })
+
+-- Apply hunks (ascending, from diff_hunks(old, new)) to old
+apply_hunks = (old, new, hunks) ->
+    out = {}
+    pos = 1
+    for h in *hunks
+        sa, ca, sb, cb = h[1], h[2], h[3], h[4]
+        first = ca == 0 and sa + 1 or sa
+        for i = pos, first - 1
+            table.insert(out, old[i])
+        for j = sb, sb + cb - 1
+            table.insert(out, new[j]) if cb > 0
+        pos = first + ca
+    for i = pos, #old
+        table.insert(out, old[i])
+    out
+
+-- Old-side line span of a hunk (insertions touch the lines around them)
+hunk_span = (h) ->
+    if h[2] == 0
+        h[1], h[1] + 1
+    else
+        h[1], h[1] + h[2] - 1
+
+-- Edit output is the rewritten window. Returns the window with only the
+-- changes near the cursor applied, or nil when there is nothing to show.
+-- truncated: generation hit the token limit, so the tail of the window is
+-- missing; that missing tail is not an edit.
+post_process_edit = (text, truncated, current_lines, cursor_offset=0, proximity=8) ->
+    return nil unless text
+    text = strip_special(text)
+    -- The prompt ends with "<|file_sep|>updated/<path>": the output starts
+    -- with that line's newline and usually ends with one before the next
+    -- separator. Only those are dropped.
+    text = text\gsub('^\r?\n', '')
+    text = text\gsub('\n$', '')
+    text = text\gsub('\r$', '')
+    updated = text\match('%S') and vim.split(text, '\n', { plain: true }) or {}
+    table.remove(updated) if truncated and #updated > 0
+    -- No output means no prediction, not "delete the window"
+    return nil if #updated == 0
+    return updated unless current_lines and #current_lines > 0
+
+    local hunks
+    if truncated
+        -- Compare with the same number of window lines. A line the model
+        -- inserted (or deleted) then shifts the end, showing up as a
+        -- trailing pure deletion (insertion), which is not a real edit.
+        base = [l for l in *current_lines[1, math.min(#updated, #current_lines)]]
+        hunks = diff_hunks(base, updated)
+        last = hunks[#hunks]
+        if last
+            pure_del_at_end = last[4] == 0 and last[1] + last[2] - 1 >= #base
+            pure_ins_at_end = last[2] == 0 and last[3] + last[4] - 1 >= #updated
+            table.remove(hunks) if pure_del_at_end or pure_ins_at_end
+    else
+        hunks = diff_hunks(current_lines, updated)
+    cursor = cursor_offset + 1
+    kept = {}
+    for h in *hunks
+        lo, hi = hunk_span(h)
+        if hi >= cursor - proximity and lo <= cursor + proximity
+            table.insert(kept, h)
+    return nil if #kept == 0
+    apply_hunks(current_lines, updated, kept)
+
+export default {
+    :strip_special
+    :next_suffix_line
+    :fim_should_stop
+    :post_process_fim
+    :post_process_edit
+    :diff_hunks
+    :apply_hunks
+}

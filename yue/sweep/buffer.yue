@@ -2,6 +2,27 @@
 
 api = vim.api
 
+-- Map the current-buffer line range [s, e] to the original snapshot
+-- through the diff between the two, so lines inserted or deleted above the
+-- window don't shift it. A bound inside a changed hunk maps to that hunk's
+-- edge on the original side.
+original_range = (orig_all, cur_all, s, e) ->
+    hunks = vim.diff(table.concat(orig_all, '\n') .. '\n', table.concat(cur_all, '\n') .. '\n',
+        { result_type: 'indices', algorithm: 'histogram' })
+    to_orig = (l, at_end) ->
+        delta = 0
+        for h in *hunks
+            sa, ca, sb, cb = h[1], h[2], h[3], h[4]
+            new_lo = cb > 0 and sb or sb + 1
+            return l - delta if l < new_lo
+            if cb > 0 and l <= sb + cb - 1
+                if at_end
+                    return ca > 0 and sa + ca - 1 or sa
+                return ca > 0 and sa or sa + 1
+            delta += cb - ca
+        l - delta
+    to_orig(s, false), to_orig(e, true)
+
 export default class BufferState
     config: nil
     buffer_states: {}
@@ -107,6 +128,7 @@ export default class BufferState
 
         state = @buffer_states[bufnr] or {}
         state.original_all_lines = api.nvim_buf_get_lines(bufnr, 0, -1, false)
+        state.original_tick = api.nvim_buf_get_changedtick(bufnr)
         state.bufnr = bufnr
         state.filepath = api.nvim_buf_get_name(bufnr)
         state.filetype = vim.bo[bufnr].filetype
@@ -123,17 +145,14 @@ export default class BufferState
 
         window = @get_window(bufnr, line_num)
 
-        -- Also get FIM context: current line + previous lines
+        -- FIM context: the cursor line
         line_content = api.nvim_buf_get_lines(bufnr, line_num - 1, line_num, false)[1] or ''
-        prev_start = math.max(1, line_num - 5)
-        prev_lines = api.nvim_buf_get_lines(bufnr, prev_start - 1, line_num - 1, false)
 
         state = @buffer_states[bufnr] or {}
         state.current_window = window
         state.line_num = line_num
         state.cursor_col = col
         state.line_content = line_content
-        state.prev_lines = prev_lines
         state.bufnr = bufnr
         state.filepath = api.nvim_buf_get_name(bufnr)
         state.filetype = vim.bo[bufnr].filetype
@@ -141,8 +160,13 @@ export default class BufferState
         state.timestamp = vim.uv.hrtime()
         @buffer_states[bufnr] = state
 
-    -- Get context for completion request
-    get_context: (bufnr) =>
+    -- Drop everything kept for a wiped-out buffer
+    forget: (bufnr) =>
+        @buffer_states[bufnr] = nil
+
+    -- Get context for completion request. The original window (diffed
+    -- against the whole buffer) is only needed for edit prompts.
+    get_context: (bufnr, mode='edit') =>
         bufnr = bufnr or api.nvim_get_current_buf()
         state = @buffer_states[bufnr]
         return nil unless state
@@ -150,18 +174,17 @@ export default class BufferState
 
         current = state.current_window
 
-        -- Extract original lines using the CURRENT window bounds.
-        -- This ensures original_lines and current_lines are always aligned
-        -- (same line range), so the model sees a clean diff, not phantom
-        -- additions/deletions from window boundary shifts.
-        original_lines = if state.original_all_lines
-            orig = {}
-            end_idx = math.min(current.end_line, #state.original_all_lines)
-            for i = current.start_line, end_idx
-                table.insert(orig, state.original_all_lines[i])
-            orig
+        -- The original text of the same lines as the current window, so
+        -- the model sees the real edit, not phantom changes from lines
+        -- inserted or deleted above the window since the snapshot
+        orig_all = state.original_all_lines
+        original_lines = if mode ~= 'edit' or not orig_all or
+                api.nvim_buf_get_changedtick(bufnr) == state.original_tick
+            current.lines  -- unchanged (or not needed)
         else
-            current.lines  -- no original yet, treat current as original
+            cur_all = api.nvim_buf_get_lines(bufnr, 0, -1, false)
+            s, e = original_range(orig_all, cur_all, current.start_line, current.end_line)
+            [orig_all[i] for i = math.max(1, s), math.min(e, #orig_all)]
 
         {
             bufnr: bufnr
@@ -171,7 +194,6 @@ export default class BufferState
             cursor_col: state.cursor_col
             -- FIM context
             line_content: state.line_content
-            prev_lines: state.prev_lines
             -- Window data for edit mode
             original_lines: original_lines
             current_lines: current.lines
