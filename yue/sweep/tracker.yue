@@ -497,6 +497,20 @@ export default class EditTracker
 
         return chunks
 
+    -- Earlier versions of lines in bufnr's history: trimmed line -> list of
+    -- the trimmed lines it was edited from. Only line-for-line edits count.
+    line_versions: (bufnr) =>
+        versions = {}
+        for e in *@edit_history
+            continue unless e.bufnr == bufnr and #e.old_lines == #e.new_lines
+            for i = 1, #e.new_lines
+                old = e.old_lines[i]\match('^%s*(.-)%s*$')
+                new = e.new_lines[i]\match('^%s*(.-)%s*$')
+                continue if old == new or #new == 0
+                versions[new] = versions[new] or {}
+                table.insert(versions[new], old)
+        versions
+
     -- Full cleanup
     clear: () =>
         @attached_bufs = {}

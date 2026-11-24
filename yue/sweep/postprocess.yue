@@ -170,10 +170,31 @@ edit_spans = (original, current) ->
             table.insert(spans, { h[3], h[3] + 1 })
     spans
 
+-- Whether old is an earlier version of line: versions maps a trimmed
+-- line to the trimmed texts it was edited from (see
+-- EditTracker.line_versions), followed back through every earlier edit
+earlier_version = (versions, line, old) ->
+    old = trim(old)
+    seen = {}
+    todo = { trim(line) }
+    while #todo > 0
+        l = table.remove(todo)
+        for prev in *(versions[l] or {})
+            return true if prev == old
+            unless seen[prev]
+                seen[prev] = true
+                table.insert(todo, prev)
+    false
+
 -- A model hunk that undoes the user's change: it rewrites a line they
 -- just edited (adding text after what they typed is fine, e.g. a comma
--- and the next entry), or puts back only lines they just deleted
-reverts_edit = (h, current, updated, edited, deleted) ->
+-- and the next entry), puts back only lines they just deleted, or turns
+-- a line back into an earlier version of it from the edit history
+-- (which also holds edits from before this session)
+reverts_edit = (h, current, updated, edited, deleted, versions) ->
+    if versions and h[2] > 0 and h[2] == h[4]
+        for k = 0, h[2] - 1
+            return true if earlier_version(versions, current[h[1] + k], updated[h[3] + k])
     if h[2] > 0
         touches = false
         for i = h[1], h[1] + h[2] - 1
@@ -199,7 +220,9 @@ reverts_edit = (h, current, updated, edited, deleted) ->
 -- missing; that missing tail is not an edit.
 -- original_lines: the window before the user's change; hunks that undo
 -- that change are dropped.
-post_process_edit = (text, truncated, current_lines, cursor_offset=0, proximity=8, original_lines=nil) ->
+-- versions: earlier versions of lines (EditTracker.line_versions); hunks
+-- turning a line back into one of them are dropped too.
+post_process_edit = (text, truncated, current_lines, cursor_offset=0, proximity=8, original_lines=nil, versions=nil) ->
     return nil unless text
     text = strip_special(text)
     -- The prompt ends with "<|file_sep|>updated/<path>": the output starts
@@ -234,7 +257,7 @@ post_process_edit = (text, truncated, current_lines, cursor_offset=0, proximity=
     for h in *hunks
         lo, hi = hunk_span(h)
         near = hi >= cursor - proximity and lo <= cursor + proximity
-        if near and not reverts_edit(h, current_lines, updated, edited, deleted)
+        if near and not reverts_edit(h, current_lines, updated, edited, deleted, versions)
             table.insert(kept, h)
     return nil if #kept == 0
     apply_hunks(current_lines, updated, kept)

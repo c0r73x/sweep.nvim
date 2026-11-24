@@ -164,5 +164,12 @@ t3:restore_history(fbuf)
 eq('restore once', #t3.edit_history, 3)
 t3:shutdown()
 
+
+-- Earlier versions of lines, from the buffer's own history only
+local t4 = EditTracker(config)
+t4.edit_history = { entry(buf, 1, '  a = 1', '  a = 2'), entry(buf, 1, 'a = 2', 'a = 3'), entry(buf + 1, 1, 'x', 'y'),
+    { bufnr = buf, start_line = 5, end_line = 6, old_lines = { 'p' }, new_lines = { 'q', 'r' } } }
+eq('line versions', t4:line_versions(buf), { ['a = 2'] = { 'a = 1' }, ['a = 3'] = { 'a = 2' } })
+
 print(fails == 0 and 'ALL PASS' or (fails .. ' FAILED'))
 os.exit(fails == 0 and 0 or 1)

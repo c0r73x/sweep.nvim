@@ -173,8 +173,9 @@ export default class SweepClient
                 return callback(#result > 0 and result or nil, nil)
 
             proximity = @config.provider.edit_proximity or 8
+            versions = tracker and tracker\line_versions(context.bufnr)
             lines = post.post_process_edit(text, truncated, context.current_lines,
-                context.cursor_offset or 0, proximity, context.original_lines)
+                context.cursor_offset or 0, proximity, context.original_lines, versions)
             callback(lines, nil)
         )
         @abort = abort

@@ -103,5 +103,19 @@ r = p.post_process_edit('a\nx = 3\nb', false, { 'a', 'x = 2', 'b' }, 1, 8, nil)
 eq('no original: unchanged behaviour', r, { 'a', 'x = 3', 'b' })
 eq('edit spans', p.edit_spans({ 'a', 'b', 'c', 'd' }, { 'a', 'B', 'c' }), { { 2, 2 }, { 3, 4 } })
 
+
+-- Turning a line back into an earlier version from the history (also
+-- from before this session) is dropped, through chains of edits
+local versions = { ['const baba = true;'] = { 'const foozbar = true;' },
+                   ['const foozbar = true;'] = { 'const barfoo = true;' },
+                   ['const barfoo = true;'] = { 'const foozbar = true;' } }
+local w = { 'a', 'const baba = true;', '', 'if (foozbar) {', 'b' }
+local function out(l2, l4) local t = vim.deepcopy(w); t[2] = l2; t[4] = l4; return table.concat(t, '\n') end
+eq('history revert dropped', p.post_process_edit(out('const foozbar = true;', w[4]), false, w, 1, 8, nil, versions), nil)
+eq('older history revert dropped', p.post_process_edit(out('const barfoo = true;', w[4]), false, w, 1, 8, nil, versions), nil)
+r = p.post_process_edit(out('const foozbar = true;', 'if (baba) {'), false, w, 1, 8, nil, versions)
+eq('revert dropped, rename kept', r and { r[2], r[4] }, { w[2], 'if (baba) {' })
+eq('no versions: unchanged', p.post_process_edit(out('const foozbar = true;', w[4]), false, w, 1, 8, nil, nil)[2], 'const foozbar = true;')
+
 print(fails == 0 and 'ALL PASS' or (fails .. ' FAILED'))
 os.exit(fails == 0 and 0 or 1)
